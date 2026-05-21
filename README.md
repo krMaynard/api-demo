@@ -56,9 +56,24 @@ python seed.py
 
 # 2. Run the server in one terminal (leave it running)
 uvicorn main:app --port 8000
+```
 
-# --- in a second terminal: ---
+### Automated walkthrough (recommended)
 
+`demo.py` is a narrated script that walks through every major feature —
+auth, table listing, query submission, polling, result fetching, job
+isolation, read-only rejection, and cleanup — with coloured output showing
+each request and response.
+
+```bash
+# In a second terminal (server must be running):
+python demo.py           # auto-advance with a short pause between steps
+python demo.py --pause   # press Enter to advance each step (live demo mode)
+```
+
+### Manual curl walkthrough
+
+```bash
 # 3. Set your key once so you don't have to repeat it
 export KEY='alice'
 
