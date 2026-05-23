@@ -41,8 +41,8 @@ Jobs are scoped per key — `bob` cannot list, view, fetch, or cancel jobs
 submitted with `alice`'s key (foreign job ids return `404`, not `403`, so the
 existence of other researchers' jobs isn't leaked).
 
-In a real deployment these keys would come from a secret store, not be
-hard-coded in `main.py`.
+In production, set `API_KEYS_JSON` to a JSON object loaded from a secret
+manager rather than using the demo fallback. See `PRODUCTIONIZE.md`.
 
 ## Try the demo from your terminal
 
@@ -52,7 +52,11 @@ git clone https://github.com/krMaynard/api-demo.git
 cd api-demo
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# seed.py reads from the sibling krMaynard.github.io repo by default;
+# override with --source if the JSON lives elsewhere
 python seed.py
+# python seed.py --source /path/to/google-government-removals.json --db demo.db
 
 # 2. Run the server in one terminal (leave it running)
 uvicorn main:app --port 8000
@@ -133,6 +137,8 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | Method | Path                                | Auth | Description                                    |
 |--------|-------------------------------------|------|------------------------------------------------|
 | GET    | `/`                                 | —    | Service info                                   |
+| GET    | `/healthz`                          | —    | Liveness probe                                 |
+| GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
 | GET    | `/tables`                           | key  | List tables                                    |
 | GET    | `/schema/{table}`                   | key  | Show a table's columns                         |
 | POST   | `/query`                            | key  | Submit a SQL query — returns `202 + job_id`    |
@@ -188,15 +194,63 @@ WHERE c.code IN ('DE','FR','IT','ES','PL','NL','BE','SE','AT','IE')
 GROUP BY pr.label ORDER BY pr.id;
 ```
 
+## Configuration
+
+All tuneable values are read from environment variables at startup:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `demo.db` beside `main.py` | Path to the SQLite database |
+| `ROW_LIMIT` | `100000` | Max rows returned per query |
+| `WORKER_THREADS` | `4` | Background worker thread count |
+| `QUERY_TIMEOUT_SECONDS` | `300` | SQLite busy timeout |
+| `REDIS_URL` | _(unset — uses memory)_ | Redis connection URL for persistent job storage |
+| `JOB_TTL_SECONDS` | `86400` | How long to retain jobs in Redis (24 h) |
+| `API_KEYS_JSON` | `alice` / `bob` demo keys | JSON object: `{"<key>": {"name": "<name>"}, …}` |
+
+Copy `.env.example` to `.env` and edit before running Docker Compose.
+
+## Deploying
+
+The service ships with a `Dockerfile` and `docker-compose.yml`. To run it
+with Redis-backed job persistence:
+
+```bash
+# 1. Build the database (once)
+python seed.py --db demo.db
+
+# 2. Configure
+cp .env.example .env   # edit API_KEYS_JSON at minimum
+
+# 3. Start
+docker-compose up --build
+
+# Verify
+curl http://localhost:8000/readyz
+```
+
+For HTTPS and a public domain, see `PRODUCTIONIZE.md` — Railway and Fly.io
+are the fastest paths (automatic HTTPS, managed Redis, ~1 hour to live).
+
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest test_api.py -v
+```
+
+No running server or Redis needed — the test suite uses FastAPI's in-process
+`TestClient` and a temporary SQLite database created in `conftest.py`.
+
 ## Safety notes
 
 - The DB is opened with `mode=ro`, so any `INSERT`/`UPDATE`/`DELETE`/`DROP`
   surfaces as `status=failed` with a `readonly database` error — no SQL
   parsing required.
-- Per-job results are capped at 100,000 rows; over that the job fails and the
-  client is asked to add a `LIMIT`.
-- Jobs and their result rows live in process memory. Restart = clear.
-- This is a **demo**. Production would need: persistent job storage, real
-  auth (OAuth/OIDC + rotating keys from a secret store), per-user quotas,
-  query allow-listing or row-level filtering, and result pagination/streaming
-  for large outputs.
+- Per-job results are capped at `ROW_LIMIT` rows (default 100k); over that
+  the job fails and the client is asked to add a `LIMIT`.
+- When `REDIS_URL` is set, jobs and results persist across restarts and are
+  shared across multiple processes. Without it, everything lives in memory
+  and a restart clears all jobs.
+- See `PRODUCTIONIZE.md` for what's still needed before handling real traffic
+  (rate limiting, structured logging, WAL mode, metrics, etc.).
