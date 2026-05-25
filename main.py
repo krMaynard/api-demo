@@ -11,7 +11,9 @@ Configuration (environment variables):
     ROW_LIMIT              max rows returned per query (default: 100000)
     WORKER_THREADS         background worker count (default: 4)
     QUERY_TIMEOUT_SECONDS  SQLite busy timeout in seconds (default: 300)
-    REDIS_URL              Redis connection URL; omit to use in-process memory store
+    REDIS_URL              standard Redis URL (rediss://...); used with redis-py
+    UPSTASH_REDIS_REST_URL    Upstash REST URL  } use these two together
+    UPSTASH_REDIS_REST_TOKEN  Upstash REST token} instead of REDIS_URL
     JOB_TTL_SECONDS        how long to retain completed jobs in Redis (default: 86400)
     API_KEYS_JSON          JSON object mapping key→{name:str}; falls back to demo keys
 """
@@ -39,6 +41,8 @@ ROW_LIMIT = int(os.getenv("ROW_LIMIT", "100000"))
 WORKER_THREADS = int(os.getenv("WORKER_THREADS", "4"))
 QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "300"))
 REDIS_URL = os.getenv("REDIS_URL")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "86400"))
 
 
@@ -159,11 +163,14 @@ class MemoryJobStore:
 
 
 class RedisJobStore:
-    """Redis-backed store. Enables multiple web/worker processes and survives restarts."""
+    """Redis-backed store. Enables multiple web/worker processes and survives restarts.
 
-    def __init__(self, url: str, ttl: int = JOB_TTL) -> None:
-        import redis
-        self._r = redis.from_url(url, decode_responses=True)
+    Accepts any client with a redis-py-compatible interface — works with
+    both redis-py (via REDIS_URL) and upstash-redis (via UPSTASH_REDIS_REST_*).
+    """
+
+    def __init__(self, client: Any, ttl: int = JOB_TTL) -> None:
+        self._r = client
         self._ttl = ttl
 
     # key helpers
@@ -247,9 +254,18 @@ class RedisJobStore:
         return [j for jid in job_ids if (j := self.get(jid)) is not None]
 
 
-_store: MemoryJobStore | RedisJobStore = (
-    RedisJobStore(REDIS_URL) if REDIS_URL else MemoryJobStore()
-)
+def _make_store() -> MemoryJobStore | RedisJobStore:
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        from upstash_redis import Redis as UpstashRedis
+        client = UpstashRedis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+        return RedisJobStore(client)
+    if REDIS_URL:
+        import redis
+        return RedisJobStore(redis.from_url(REDIS_URL, decode_responses=True))
+    return MemoryJobStore()
+
+
+_store: MemoryJobStore | RedisJobStore = _make_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
 
 app = FastAPI(
@@ -356,7 +372,7 @@ def root() -> dict[str, Any]:
         },
         "row_limit": ROW_LIMIT,
         "worker_threads": WORKER_THREADS,
-        "store": "redis" if REDIS_URL else "memory",
+        "store": "upstash" if UPSTASH_REDIS_REST_URL else ("redis" if REDIS_URL else "memory"),
     }
 
 
