@@ -62,7 +62,7 @@ A developer giving a live presentation who runs `demo.py --pause` to step throug
 
 | ID | Requirement |
 |----|-------------|
-| F-01 | `GET /` returns service metadata: API name, version, list of endpoints, current configuration (DB path, row limit, worker count). |
+| F-01 | `GET /` returns service metadata: API name, version, list of endpoints, current configuration (row limit, worker count, backing store type). The DB path is intentionally not exposed to avoid leaking internal server paths. |
 | F-02 | `GET /healthz` always returns `{"status": "ok"}`. Used as a liveness probe. |
 | F-03 | `GET /readyz` attempts a DB connection and returns `{"status": "ok"}` on success or `503` with an error detail on failure. Used as a readiness probe. |
 | F-04 | Swagger UI is available at `/docs`; OpenAPI schema at `/openapi.json`. No auth required. |
@@ -107,7 +107,7 @@ queued → running → done
 |----|-------------|
 | F-15 | `GET /jobs` lists the authenticated user's jobs, newest first, with a configurable `limit` query param. |
 | F-16 | `GET /jobs/{id}` returns full job metadata: status, timestamps, row count, error message (if any), and a `result_url` (only when `status=done`). |
-| F-17 | `DELETE /jobs/{id}` on a queued job marks it `cancelled` before it starts. On a running job it calls `sqlite3.interrupt()` to abort the in-flight query, then marks it `cancelled`. On a finished job it removes it from the registry. |
+| F-17 | `DELETE /jobs/{id}` on a queued job marks it `cancelled` before it starts. On a running job it calls `sqlite3.interrupt()` to abort the in-flight query. In all cases the job is **immediately removed from the registry** after the status update, so subsequent requests for that job ID return `404 Not Found` rather than a `cancelled` status. |
 | F-18 | Completed jobs (done/failed/cancelled) expire automatically after `JOB_TTL_SECONDS` (default: 86,400 s / 24 h) when a Redis backend is in use. |
 
 ### 3.6 Result Retrieval
@@ -170,15 +170,15 @@ queued → running → done
 
 The database is seeded from the [Google Government Content Removals](https://transparencyreport.google.com/government-removals/overview) dataset.
 
-**Dimension tables** (each: `id INTEGER PRIMARY KEY`, `name TEXT`):
+**Dimension tables** (each has `id INTEGER PRIMARY KEY` as surrogate key, plus table-specific descriptive columns):
 
-| Table | Description |
-|-------|-------------|
-| `periods` | Reporting period labels, e.g. "January – June 2024" |
-| `countries` | ISO country code + display name |
-| `requestors` | Type of requesting entity (Court Order, Police, etc.) |
-| `products` | Google product (YouTube, Web Search, Maps, etc.) |
-| `reasons` | Removal reason (Defamation, National Security, Privacy, etc.) |
+| Table | Columns | Description |
+|-------|---------|-------------|
+| `periods` | `id`, `label` | Reporting period labels, e.g. "January – June 2024" |
+| `countries` | `id`, `code`, `name` | ISO country code + display name |
+| `requestors` | `id`, `name` | Type of requesting entity (Court Order, Police, etc.) |
+| `products` | `id`, `name` | Google product (YouTube, Web Search, Maps, etc.) |
+| `reasons` | `id`, `name` | Removal reason (Defamation, National Security, Privacy, etc.) |
 
 **Fact table — `removals`**:
 

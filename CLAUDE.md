@@ -81,6 +81,16 @@ The DB is opened `mode=ro` — any write attempt surfaces as `status=failed`.
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
 
+## Code Review Workflow
+
+Whenever a pull request is created or updated, **always check for Gemini
+code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
+
+1. Call `pull_request_read` with `method=get_reviews` to find the Gemini review summary.
+2. Call `pull_request_read` with `method=get_review_comments` to get inline thread details.
+3. Verify each finding against the actual source files before acting.
+4. Apply confirmed fixes, commit, and push on the same branch.
+
 ## Endpoints
 
 | Method | Path | Auth | Notes |
