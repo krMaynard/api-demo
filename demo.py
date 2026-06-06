@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Walkthrough of the api-demo SQL Query API.
+Walkthrough of the api-demo structured-query API.
 
 Start the server first (in a separate terminal):
     uvicorn main:app --port 8000
@@ -147,24 +147,27 @@ def main() -> None:
     _note("Star schema: one removals fact table + five dimension tables.")
     get("/tables", key="alice")
 
-    # 4. Inspect the fact table schema
-    _step("Inspect the schema for the 'removals' table")
-    _note("Shows column names, types, and PK/NOT NULL constraints.")
-    get("/schema/removals", key="alice")
+    # 4. Inspect the queryable fields
+    _step("Discover the queryable fields  (GET /fields)")
+    _note("Clients never send SQL — they pick from these fields and operations.")
+    _note("Dimensions support EQ/IN; measures also support GT/GTE/LT/LTE.")
+    get("/fields", key="alice")
 
     # 5. Submit a query — the core pattern
-    _step("Submit a query — POST /query returns 202 immediately")
-    _note("The query runs on a background worker. We get a job_id back straight away.")
+    _step("Submit a structured query — POST /query returns 202 immediately")
+    _note("The query is described with parameters (TikTok-Research-API style),")
+    _note("compiled to a safe parameterised SELECT, and run on a background worker.")
     _note("Query: top 5 countries by total items requested for removal.")
-    sql_top5 = (
-        "SELECT c.name, SUM(r.items_requested) AS items "
-        "FROM removals r "
-        "JOIN countries c ON c.id = r.country_id "
-        "GROUP BY c.name ORDER BY items DESC LIMIT 5"
-    )
-    _, job = post("/query", {"sql": sql_top5}, key="alice")
+    top5 = {
+        "group_by": ["country_name"],
+        "aggregates": [{"function": "SUM", "field_name": "items_requested", "alias": "items"}],
+        "sort": [{"field_name": "items", "order": "desc"}],
+        "max_count": 5,
+    }
+    _, job = post("/query", top5, key="alice")
     job_id: str = job["job_id"]
     print(f"  {DIM}job_id = {job_id}{RESET}")
+    print(f"  {DIM}compiled_sql = {job.get('compiled_sql')}{RESET}")
 
     # 6. Poll for completion
     _step("Poll GET /jobs/{job_id} until status=done")
@@ -180,36 +183,37 @@ def main() -> None:
     _note("Foreign job IDs return 404 (not 403) so existence isn't leaked.")
     get(f"/jobs/{job_id}", key="bob")
 
-    # 9. Read-only database rejects writes
-    _step("Write attempt → job fails (SQLite is opened read-only)")
-    _note("No SQL parsing needed — the DB connection itself rejects DDL/DML.")
-    _, bad_job = post("/query", {"sql": "DELETE FROM countries"}, key="alice")
-    bad_id: str = bad_job["job_id"]
-    time.sleep(0.5)
-    _, bad_final = get(f"/jobs/{bad_id}", key="alice")
-    print(f"  {DIM}status={bad_final.get('status')}  error={bad_final.get('error')!r}{RESET}")
+    # 9. Arbitrary / invalid queries are rejected up front
+    _step("Invalid query → 400 (no SQL, no unknown fields)")
+    _note("There's no `sql` field to abuse. Unknown fields fail validation")
+    _note("immediately — the request never becomes a job.")
+    post(
+        "/query",
+        {"query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
+        key="alice",
+    )
 
     # 10. List jobs
     _step("List all of alice's jobs")
     _note("Bob's jobs are invisible; alice sees only her own.")
     get("/jobs", key="alice")
 
-    # 11. Cancel / clean up the failed job
+    # 11. Cancel / clean up a finished job
     _step("Delete a finished job (also works mid-run to cancel)")
     _note("DELETE while running calls sqlite3.interrupt() to abort the query.")
-    delete(f"/jobs/{bad_id}", key="alice")
+    delete(f"/jobs/{job_id}", key="alice")
 
-    # 12. Bonus: a second query to show off the data
+    # 12. Bonus: a filtered breakdown to show off the data
     _step("Bonus query: defamation requests broken down by product")
-    sql_defamation = (
-        "SELECT p.name AS product, SUM(r.num_requests) AS requests "
-        "FROM removals r "
-        "JOIN products p ON p.id = r.product_id "
-        "JOIN reasons rn ON rn.id = r.reason_id "
-        "WHERE rn.name = 'Defamation' "
-        "GROUP BY p.name ORDER BY requests DESC"
-    )
-    _, j2 = post("/query", {"sql": sql_defamation}, key="alice")
+    defamation = {
+        "query": {
+            "and": [{"operation": "EQ", "field_name": "reason_name", "field_values": ["Defamation"]}]
+        },
+        "group_by": ["product_name"],
+        "aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "requests"}],
+        "sort": [{"field_name": "requests", "order": "desc"}],
+    }
+    _, j2 = post("/query", defamation, key="alice")
     j2_id: str = j2["job_id"]
     _poll(j2_id, key="alice")
     get(f"/jobs/{j2_id}/result?format=json", key="alice")

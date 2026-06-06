@@ -1,10 +1,17 @@
-"""Demo SQL-over-HTTP API for researchers, with async job execution.
+"""Demo structured-query API for researchers, with async job execution.
+
+Clients do NOT send SQL. They describe what they want with structured
+parameters — boolean `and`/`or`/`not` clauses of `{operation, field_name,
+field_values}`, plus optional `group_by`, `aggregates`, `sort`, and
+`max_count` — modelled on the TikTok Research API. The server validates the
+request against a fixed field registry and compiles it into a single
+parameterised SELECT, so arbitrary SQL is never executed.
 
 Long-running queries can't tie up the HTTP connection, so submitting a query
 returns 202 + a job id immediately. The query runs on a background worker;
 clients poll /jobs/{id} for status and fetch /jobs/{id}/result when done.
 
-The database is opened read-only so DDL/DML are rejected by SQLite itself.
+The database is additionally opened read-only as defence in depth.
 
 Configuration (environment variables):
     DB_PATH                path to the SQLite database (default: demo.db beside this file)
@@ -32,7 +39,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +85,8 @@ JobStatus = Literal["queued", "running", "done", "failed", "cancelled"]
 @dataclass
 class Job:
     id: str
-    sql: str
+    sql: str  # compiled, parameterised SELECT (never user-authored SQL)
+    params: list[Any]  # bound parameters for the compiled SQL
     owner_key: str
     submitted_by: str
     status: JobStatus = "queued"
@@ -102,6 +110,7 @@ class Job:
             "finished_at": self.finished_at,
             "error": self.error,
             "row_count": rc,
+            "compiled_sql": self.sql,
             "status_url": f"/jobs/{self.id}",
             "result_url": f"/jobs/{self.id}/result" if self.status == "done" else None,
         }
@@ -196,6 +205,7 @@ class RedisJobStore:
         return {
             "id": job.id,
             "sql": job.sql,
+            "params": json.dumps(job.params),
             "owner_key": job.owner_key,
             "submitted_by": job.submitted_by,
             "status": job.status,
@@ -210,6 +220,7 @@ class RedisJobStore:
         return Job(
             id=h["id"],
             sql=h["sql"],
+            params=json.loads(h.get("params") or "[]"),
             owner_key=h["owner_key"],
             submitted_by=h["submitted_by"],
             status=h["status"],  # type: ignore[arg-type]
@@ -278,14 +289,273 @@ _store: MemoryJobStore | RedisJobStore = _make_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
 
 app = FastAPI(
-    title="SQL Query Demo API (async jobs)",
-    description="Submit a SQL query, get a job id, poll for results as JSON or CSV.",
-    version="0.3.0",
+    title="Structured Query Demo API (async jobs)",
+    description=(
+        "Describe a query with structured parameters (no SQL), get a job id, "
+        "poll for results as JSON or CSV. Query syntax follows the TikTok "
+        "Research API: boolean and/or/not clauses of {operation, field_name, "
+        "field_values}."
+    ),
+    version="0.4.0",
 )
 
 
+# ── Structured query model (TikTok-Research-API-style) ─────────────────────────
+#
+# Clients never send SQL. They describe what they want; the server validates
+# every field/operation against a fixed registry and compiles the request into
+# a single parameterised SELECT. Unknown fields, bad operations, or injection
+# attempts in values can't reach the database as code — values are always bound.
+
+# field_name → SQL expression. Dimensions are text columns from the joined
+# lookup tables; measures are the numeric count columns on the fact table.
+_DIMENSIONS: dict[str, str] = {
+    "period_label": "p.label",
+    "country_code": "c.code",
+    "country_name": "c.name",
+    "requestor_name": "rq.name",
+    "product_name": "pr.name",
+    "reason_name": "rn.name",
+}
+_MEASURES: dict[str, str] = {
+    "num_requests": "r.num_requests",
+    "items_requested": "r.items_requested",
+    "removed_legal": "r.removed_legal",
+    "removed_policy": "r.removed_policy",
+    "not_found": "r.not_found",
+    "not_enough_info": "r.not_enough_info",
+    "no_action": "r.no_action",
+    "already_removed": "r.already_removed",
+}
+_ALL_FIELDS: dict[str, str] = {**_DIMENSIONS, **_MEASURES}
+
+_FROM = (
+    "FROM removals r "
+    "JOIN periods p ON p.id = r.period_id "
+    "JOIN countries c ON c.id = r.country_id "
+    "JOIN requestors rq ON rq.id = r.requestor_id "
+    "JOIN products pr ON pr.id = r.product_id "
+    "JOIN reasons rn ON rn.id = r.reason_id"
+)
+
+# operation → SQL comparator (numeric fields only)
+_COMPARATORS = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}
+Operation = Literal["EQ", "IN", "GT", "GTE", "LT", "LTE"]
+AggFunction = Literal["SUM", "COUNT", "AVG", "MIN", "MAX"]
+SortOrder = Literal["asc", "desc"]
+
+
+class Condition(BaseModel):
+    """A single filter, e.g. {operation: IN, field_name: country_code, field_values: [DE, FR]}."""
+
+    operation: Operation = Field(..., description="EQ, IN, GT, GTE, LT, LTE.")
+    field_name: str = Field(..., description="A queryable field; see GET /fields.")
+    field_values: list[str | int | float] = Field(
+        ..., min_length=1, description="One or more values; always bound as parameters."
+    )
+
+
+class BooleanQuery(BaseModel):
+    """Boolean combination of conditions, matching the TikTok Research API shape."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    and_: list[Condition] = Field(default_factory=list, alias="and")
+    or_: list[Condition] = Field(default_factory=list, alias="or")
+    not_: list[Condition] = Field(default_factory=list, alias="not")
+
+
+class Aggregate(BaseModel):
+    """An aggregate column, e.g. {function: SUM, field_name: items_requested, alias: items}."""
+
+    function: AggFunction
+    field_name: str = Field(default="*", description="A measure field, or '*' for COUNT.")
+    alias: str = Field(..., description="Output column name (letters, digits, underscore).")
+
+
+class Sort(BaseModel):
+    field_name: str = Field(..., description="An output column (a group_by field or aggregate alias).")
+    order: SortOrder = "desc"
+
+
 class QueryRequest(BaseModel):
-    sql: str = Field(..., description="A single SELECT statement.", min_length=1)
+    """Structured query. No SQL is accepted."""
+
+    query: BooleanQuery = Field(default_factory=BooleanQuery, description="Filters.")
+    fields: list[str] | None = Field(
+        default=None,
+        description="Columns to return for a raw (non-aggregated) query. Defaults to all fields.",
+    )
+    group_by: list[str] = Field(default_factory=list, description="Dimension fields to group by.")
+    aggregates: list[Aggregate] = Field(default_factory=list, description="Aggregate columns.")
+    sort: list[Sort] = Field(default_factory=list, description="Result ordering.")
+    max_count: int = Field(default=100, ge=1, description="Row limit (capped at ROW_LIMIT).")
+
+
+class QueryCompileError(ValueError):
+    """Raised when a structured query is invalid; surfaced to the client as 400."""
+
+
+def _require_number(value: Any, field_name: str) -> None:
+    # bool is an int subclass — reject it explicitly so true/false isn't treated as 1/0.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QueryCompileError(f"Field '{field_name}' requires numeric values.")
+
+
+def _require_string(value: Any, field_name: str) -> None:
+    # Dimensions are TEXT columns; a numeric value would silently match nothing
+    # under SQLite type affinity rules, so reject it up front.
+    if not isinstance(value, str):
+        raise QueryCompileError(f"Field '{field_name}' requires string values.")
+
+
+def _compile_condition(cond: Condition) -> tuple[str, list[Any]]:
+    field = cond.field_name
+    if field not in _ALL_FIELDS:
+        raise QueryCompileError(f"Unknown field '{field}'. See GET /fields.")
+    col = _ALL_FIELDS[field]
+    is_measure = field in _MEASURES
+    op = cond.operation
+    values = cond.field_values
+
+    if op in _COMPARATORS:
+        if not is_measure:
+            raise QueryCompileError(f"Operation {op} is only valid on numeric fields, not '{field}'.")
+        if len(values) != 1:
+            raise QueryCompileError(f"Operation {op} takes exactly one value.")
+        _require_number(values[0], field)
+        return f"{col} {_COMPARATORS[op]} ?", [values[0]]
+
+    if op == "EQ":
+        if len(values) != 1:
+            raise QueryCompileError("Operation EQ takes exactly one value; use IN for multiple.")
+        if is_measure:
+            _require_number(values[0], field)
+        else:
+            _require_string(values[0], field)
+        return f"{col} = ?", [values[0]]
+
+    if op == "IN":
+        for v in values:
+            if is_measure:
+                _require_number(v, field)
+            else:
+                _require_string(v, field)
+        placeholders = ", ".join(["?"] * len(values))
+        return f"{col} IN ({placeholders})", list(values)
+
+    raise QueryCompileError(f"Unsupported operation '{op}'.")  # pragma: no cover
+
+
+def _compile_where(q: BooleanQuery) -> tuple[str, list[Any]]:
+    groups: list[str] = []
+    params: list[Any] = []
+
+    def _and(conditions: list[Condition]) -> str:
+        frags = []
+        for c in conditions:
+            frag, p = _compile_condition(c)
+            frags.append(frag)
+            params.extend(p)
+        return " AND ".join(frags)
+
+    if q.and_:
+        groups.append(_and(q.and_))
+    if q.or_:
+        frags = []
+        for c in q.or_:
+            frag, p = _compile_condition(c)
+            frags.append(frag)
+            params.extend(p)
+        groups.append("(" + " OR ".join(frags) + ")")
+    if q.not_:
+        frags = []
+        for c in q.not_:
+            frag, p = _compile_condition(c)
+            frags.append(f"NOT ({frag})")
+            params.extend(p)
+        groups.append(" AND ".join(frags))
+
+    return " AND ".join(g for g in groups if g), params
+
+
+def _safe_alias(alias: str) -> str:
+    if not alias or not all(ch.isalnum() or ch == "_" for ch in alias):
+        raise QueryCompileError(f"Invalid alias '{alias}'. Use letters, digits, and underscores.")
+    return alias
+
+
+def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
+    """Validate a structured query and compile it to (sql, params, output_columns)."""
+    where, params = _compile_where(req.query)
+    aggregating = bool(req.aggregates) or bool(req.group_by)
+
+    if aggregating and req.fields:
+        raise QueryCompileError("`fields` cannot be combined with `group_by`/`aggregates`.")
+
+    select_parts: list[str] = []
+    columns: list[str] = []
+    col_expr: dict[str, str] = {}  # output column name → expression (for ORDER BY)
+
+    if aggregating:
+        for gb in req.group_by:
+            if gb not in _DIMENSIONS:
+                raise QueryCompileError(f"group_by field '{gb}' must be a dimension. See GET /fields.")
+            if gb in col_expr:
+                raise QueryCompileError(f"Duplicate group_by field '{gb}'.")
+            expr = _DIMENSIONS[gb]
+            select_parts.append(f"{expr} AS {gb}")
+            columns.append(gb)
+            col_expr[gb] = expr
+        for agg in req.aggregates:
+            alias = _safe_alias(agg.alias)
+            if alias in col_expr:
+                raise QueryCompileError(f"Duplicate or clashing output column '{alias}'.")
+            if agg.function == "COUNT" and agg.field_name in ("*", ""):
+                expr = "COUNT(*)"
+            elif agg.field_name not in _MEASURES:
+                raise QueryCompileError(
+                    f"Aggregate field '{agg.field_name}' must be a numeric measure. See GET /fields."
+                )
+            else:
+                expr = f"{agg.function}({_MEASURES[agg.field_name]})"
+            select_parts.append(f"{expr} AS {alias}")
+            columns.append(alias)
+            col_expr[alias] = expr
+    else:
+        fields = req.fields if req.fields is not None else list(_ALL_FIELDS)
+        if not fields:
+            raise QueryCompileError("`fields` must name at least one column.")
+        for f in fields:
+            if f not in _ALL_FIELDS:
+                raise QueryCompileError(f"Unknown field '{f}'. See GET /fields.")
+            if f in col_expr:
+                raise QueryCompileError(f"Duplicate field '{f}' in fields list.")
+            expr = _ALL_FIELDS[f]
+            select_parts.append(f"{expr} AS {f}")
+            columns.append(f)
+            col_expr[f] = expr
+
+    order_parts = []
+    for s in req.sort:
+        if s.field_name not in col_expr:
+            raise QueryCompileError(
+                f"Cannot sort by '{s.field_name}'; it is not a selected output column."
+            )
+        order_parts.append(f"{col_expr[s.field_name]} {'DESC' if s.order == 'desc' else 'ASC'}")
+
+    limit = min(req.max_count, ROW_LIMIT)
+
+    sql = f"SELECT {', '.join(select_parts)} {_FROM}"
+    if where:
+        sql += f" WHERE {where}"
+    if req.group_by:
+        sql += " GROUP BY " + ", ".join(_DIMENSIONS[g] for g in req.group_by)
+    if order_parts:
+        sql += " ORDER BY " + ", ".join(order_parts)
+    sql += f" LIMIT {limit}"
+
+    return sql, params, columns
 
 
 def _now() -> str:
@@ -316,7 +586,7 @@ def _execute_job(job_id: str) -> None:
             _active_conns[job_id] = conn
 
         try:
-            cur = conn.execute(job.sql)
+            cur = conn.execute(job.sql, job.params)
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchmany(ROW_LIMIT + 1)
         finally:
@@ -364,15 +634,17 @@ def _job_for_owner(job_id: str, owner_key: str) -> Job:
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
-        "name": "SQL Query Demo API",
+        "name": "Structured Query Demo API",
         "pattern": "async-job",
+        "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted)",
         "auth": "X-API-Key header required for all endpoints except `/`, `/docs`, `/openapi.json`",
         "endpoints": {
-            "POST /query": "Submit a SQL query, returns 202 + job_id",
+            "POST /query": "Submit a structured query, returns 202 + job_id",
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
             "GET /jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
             "DELETE /jobs/{job_id}": "Cancel a queued/running job, or remove a finished one",
+            "GET /fields": "List queryable fields and operations",
             "GET /tables": "List tables in the demo database",
             "GET /schema/{table}": "Show columns for a table",
             "GET /healthz": "Liveness probe",
@@ -397,6 +669,40 @@ def ready() -> dict[str, str]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"status": "ok"}
+
+
+@app.get("/fields")
+def list_fields(_: dict = Depends(require_api_key)) -> dict[str, Any]:
+    """Document the queryable fields and the operations each one supports."""
+    return {
+        "dimensions": {
+            "fields": sorted(_DIMENSIONS),
+            "operations": ["EQ", "IN"],
+            "usable_in": ["query", "fields", "group_by", "sort"],
+            "note": "Text fields from the lookup tables.",
+        },
+        "measures": {
+            "fields": sorted(_MEASURES),
+            "operations": ["EQ", "IN", "GT", "GTE", "LT", "LTE"],
+            "usable_in": ["query", "fields", "aggregates"],
+            "note": "Numeric count columns on the removals fact table.",
+        },
+        "aggregate_functions": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
+        "example": {
+            "query": {
+                "and": [
+                    {"operation": "IN", "field_name": "country_code", "field_values": ["DE", "FR"]},
+                    {"operation": "EQ", "field_name": "reason_name", "field_values": ["Defamation"]},
+                ]
+            },
+            "group_by": ["product_name"],
+            "aggregates": [
+                {"function": "SUM", "field_name": "num_requests", "alias": "requests"}
+            ],
+            "sort": [{"field_name": "requests", "order": "desc"}],
+            "max_count": 10,
+        },
+    }
 
 
 @app.get("/tables")
@@ -432,9 +738,15 @@ def submit_query(
     response: Response,
     principal: dict = Depends(require_api_key),
 ) -> dict[str, Any]:
+    try:
+        sql, params, _columns = compile_query(body)
+    except QueryCompileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     job = Job(
         id=uuid.uuid4().hex,
-        sql=body.sql,
+        sql=sql,
+        params=params,
         owner_key=principal["key"],
         submitted_by=principal["name"],
     )

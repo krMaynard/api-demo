@@ -1,4 +1,4 @@
-"""Smoke tests for the SQL Query API.
+"""Smoke tests for the structured-query API.
 
 conftest.py sets up a temp SQLite DB and env vars before main is imported.
 No Redis required — the in-memory store is used automatically.
@@ -14,6 +14,9 @@ client = TestClient(app)
 ALICE = {"X-API-Key": "alice"}
 BOB = {"X-API-Key": "bob"}
 
+# A trivial valid query: grand total row count (one row, one column "n").
+COUNT_ALL = {"aggregates": [{"function": "COUNT", "alias": "n"}]}
+
 
 def _wait_for_job(job_id: str, headers: dict, timeout: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout
@@ -27,8 +30,8 @@ def _wait_for_job(job_id: str, headers: dict, timeout: float = 5.0) -> dict:
     pytest.fail(f"Job {job_id} did not reach a terminal state within {timeout}s")
 
 
-def _submit_and_wait(sql: str, headers: dict = ALICE) -> dict:
-    r = client.post("/query", json={"sql": sql}, headers=headers)
+def _submit_and_wait(query: dict, headers: dict = ALICE) -> dict:
+    r = client.post("/query", json=query, headers=headers)
     assert r.status_code == 202
     return _wait_for_job(r.json()["job_id"], headers)
 
@@ -81,17 +84,32 @@ class TestSchema:
         assert client.get("/schema/bad;name", headers=ALICE).status_code == 400
 
 
+# ── Fields discovery ──────────────────────────────────────────────────────────
+
+class TestFields:
+    def test_lists_dimensions_and_measures(self):
+        r = client.get("/fields", headers=ALICE)
+        assert r.status_code == 200
+        body = r.json()
+        assert "country_code" in body["dimensions"]["fields"]
+        assert "items_requested" in body["measures"]["fields"]
+        assert "SUM" in body["aggregate_functions"]
+
+    def test_fields_requires_auth(self):
+        assert client.get("/fields").status_code == 401
+
+
 # ── Query lifecycle ───────────────────────────────────────────────────────────
 
 class TestQueryLifecycle:
     def test_submit_returns_202_with_location(self):
-        r = client.post("/query", json={"sql": "SELECT 1"}, headers=ALICE)
+        r = client.post("/query", json=COUNT_ALL, headers=ALICE)
         assert r.status_code == 202
         assert "job_id" in r.json()
         assert r.headers.get("location", "").startswith("/jobs/")
 
     def test_happy_path_json(self):
-        job = _submit_and_wait("SELECT COUNT(*) AS n FROM removals")
+        job = _submit_and_wait(COUNT_ALL)
         assert job["status"] == "done"
         r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         assert r.status_code == 200
@@ -101,17 +119,62 @@ class TestQueryLifecycle:
         assert body["rows"][0][0] == 3  # 3 rows seeded in conftest.py
 
     def test_happy_path_csv(self):
-        job = _submit_and_wait("SELECT name FROM countries ORDER BY name")
+        job = _submit_and_wait(
+            {
+                "fields": ["country_name"],
+                "sort": [{"field_name": "country_name", "order": "asc"}],
+            }
+        )
         r = client.get(f"/jobs/{job['job_id']}/result?format=csv", headers=ALICE)
         assert r.status_code == 200
         assert "text/csv" in r.headers["content-type"]
         lines = r.text.strip().splitlines()
-        assert lines[0] == "name"
+        assert lines[0] == "country_name"
         assert "Germany" in lines
         assert "United States" in lines
 
+    def test_filter_group_and_aggregate(self):
+        # Items requested per country, US only — exercises filter + group + agg + sort.
+        job = _submit_and_wait(
+            {
+                "query": {
+                    "and": [
+                        {"operation": "EQ", "field_name": "country_code", "field_values": ["US"]}
+                    ]
+                },
+                "group_by": ["country_name"],
+                "aggregates": [
+                    {"function": "SUM", "field_name": "items_requested", "alias": "items"}
+                ],
+                "sort": [{"field_name": "items", "order": "desc"}],
+            }
+        )
+        assert job["status"] == "done"
+        r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        body = r.json()
+        assert body["columns"] == ["country_name", "items"]
+        # US rows in conftest: items 100 + 30 = 130.
+        assert body["rows"] == [["United States", 130]]
+
+    def test_compiled_sql_is_parameterised(self):
+        r = client.post(
+            "/query",
+            json={
+                "query": {
+                    "and": [
+                        {"operation": "EQ", "field_name": "country_code", "field_values": ["US"]}
+                    ]
+                }
+            },
+            headers=ALICE,
+        )
+        job = _wait_for_job(r.json()["job_id"], ALICE)
+        # Value is bound, not interpolated — the literal 'US' must not appear in the SQL.
+        assert "?" in job["compiled_sql"]
+        assert "US" not in job["compiled_sql"]
+
     def test_result_before_done_is_409(self):
-        r = client.post("/query", json={"sql": "SELECT 1"}, headers=ALICE)
+        r = client.post("/query", json=COUNT_ALL, headers=ALICE)
         job_id = r.json()["job_id"]
         # Job may already be done by the time we hit the result endpoint,
         # but if it's still in-flight we expect 409.
@@ -119,7 +182,7 @@ class TestQueryLifecycle:
         assert r2.status_code in (200, 409)
 
     def test_list_jobs(self):
-        _submit_and_wait("SELECT 1")
+        _submit_and_wait(COUNT_ALL)
         r = client.get("/jobs", headers=ALICE)
         assert r.status_code == 200
         assert len(r.json()["jobs"]) >= 1
@@ -129,22 +192,111 @@ class TestQueryLifecycle:
 
 class TestJobIsolation:
     def test_bob_cannot_see_alices_job(self):
-        job = _submit_and_wait("SELECT 2")
+        job = _submit_and_wait(COUNT_ALL)
         assert client.get(f"/jobs/{job['job_id']}", headers=BOB).status_code == 404
 
     def test_bob_cannot_fetch_alices_result(self):
-        job = _submit_and_wait("SELECT 3")
+        job = _submit_and_wait(COUNT_ALL)
         r = client.get(f"/jobs/{job['job_id']}/result", headers=BOB)
         assert r.status_code == 404
 
 
-# ── Safety ────────────────────────────────────────────────────────────────────
+# ── Safety: no arbitrary SQL ──────────────────────────────────────────────────
 
 class TestSafety:
-    def test_write_is_rejected(self):
-        job = _submit_and_wait("DELETE FROM countries")
-        assert job["status"] == "failed"
-        assert "readonly" in (job.get("error") or "").lower()
+    def test_unknown_field_is_400(self):
+        r = client.post(
+            "/query",
+            json={"query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_comparator_on_text_field_is_400(self):
+        r = client.post(
+            "/query",
+            json={"query": {"and": [{"operation": "GT", "field_name": "country_name", "field_values": [5]}]}},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_bad_alias_is_400(self):
+        r = client.post(
+            "/query",
+            json={"aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "x); DROP"}]},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_injection_value_is_treated_as_data(self):
+        # A SQL-looking string in field_values is bound as a parameter, so the
+        # query runs successfully and simply matches nothing — it is never code.
+        job = _submit_and_wait(
+            {
+                "query": {
+                    "and": [
+                        {
+                            "operation": "EQ",
+                            "field_name": "country_code",
+                            "field_values": ["US'; DROP TABLE countries;--"],
+                        }
+                    ]
+                }
+            }
+        )
+        assert job["status"] == "done"
+        r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        assert r.json()["row_count"] == 0
+        # Table still intact afterwards.
+        assert client.get("/tables", headers=ALICE).json()["tables"].count("countries") == 1
+
+    def test_dimension_requires_string(self):
+        # A numeric value on a TEXT dimension would silently match nothing under
+        # SQLite affinity rules, so it is rejected up front.
+        r = client.post(
+            "/query",
+            json={"query": {"and": [{"operation": "EQ", "field_name": "country_code", "field_values": [123]}]}},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_duplicate_group_by_is_400(self):
+        r = client.post(
+            "/query",
+            json={
+                "group_by": ["country_name", "country_name"],
+                "aggregates": [{"function": "COUNT", "alias": "n"}],
+            },
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_alias_clashing_with_group_by_is_400(self):
+        r = client.post(
+            "/query",
+            json={
+                "group_by": ["country_name"],
+                "aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "country_name"}],
+            },
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_duplicate_field_is_400(self):
+        r = client.post(
+            "/query",
+            json={"fields": ["country_name", "country_name"]},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
+    def test_no_sql_field_accepted(self):
+        # The old free-form `sql` field is gone; sending it yields an empty
+        # (default) query rather than executing arbitrary SQL.
+        r = client.post("/query", json={"sql": "DROP TABLE countries"}, headers=ALICE)
+        assert r.status_code == 202
+        job = _wait_for_job(r.json()["job_id"], ALICE)
+        assert job["status"] == "done"  # ran the default SELECT, not the DROP
 
     def test_unknown_job_is_404(self):
         assert client.get("/jobs/doesnotexist", headers=ALICE).status_code == 404
@@ -154,7 +306,7 @@ class TestSafety:
 
 class TestDelete:
     def test_delete_completed_job(self):
-        job = _submit_and_wait("SELECT 1")
+        job = _submit_and_wait(COUNT_ALL)
         job_id = job["job_id"]
         r = client.delete(f"/jobs/{job_id}", headers=ALICE)
         assert r.status_code == 200
