@@ -751,10 +751,14 @@ def portal_page() -> FileResponse:
 @app.post("/portal/register", status_code=201)
 def portal_register(body: RegisterRequest) -> dict[str, Any]:
     """Issue a demo API key for a researcher (no real authentication)."""
-    if "@" not in body.email:
+    name = body.name.strip()
+    email = body.email.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    if "@" not in email:
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
     key = "rk_" + secrets.token_hex(16)
-    principal = {"name": body.name.strip(), "email": body.email.strip()}
+    principal = {"name": name, "email": email}
     with _issued_lock:
         _issued_keys[key] = principal
     return {

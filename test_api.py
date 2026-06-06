@@ -76,6 +76,10 @@ class TestPortal:
         r = client.post("/portal/register", json={"name": "Ada", "email": "not-an-email"})
         assert r.status_code == 400
 
+    def test_register_whitespace_name_is_400(self):
+        r = client.post("/portal/register", json={"name": "   ", "email": "ada@rs.org"})
+        assert r.status_code == 400
+
     def test_register_missing_field_is_422(self):
         assert client.post("/portal/register", json={"name": "Ada"}).status_code == 422
 

@@ -161,10 +161,8 @@ async function loadSchema() {
   pills("#measures", fields.measures.fields);
 
   const { tables } = await api("/tables", apiKey);
-  const details = [];
-  for (const name of tables) {
-    details.push(await api(`/schema/${name}`, apiKey));
-  }
+  // Fetch every table's schema in parallel rather than one roundtrip at a time.
+  const details = await Promise.all(tables.map((name) => api(`/schema/${name}`, apiKey)));
   $("#tables").innerHTML = details.map(renderTable).join("");
   show($("#schema-card"));
 }
