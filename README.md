@@ -39,10 +39,18 @@ schema (queryable fields + tables/columns) using that key.
 | ![Login](docs/gifs/portal-1-login.gif) | ![Key](docs/gifs/portal-2-key.gif) | ![Schema](docs/gifs/portal-3-schema.gif) |
 
 Open `http://127.0.0.1:8000/portal` after starting the server. It's a demo
-onboarding flow — there's no real authentication; `POST /portal/register`
-issues an ephemeral in-memory key (production would sit behind SSO and persist
-keys in a secret store). The issued key works on every API endpoint, exactly
-like the built-in `alice`/`bob` keys.
+onboarding flow — there's no real authentication (production would sit behind
+SSO) — but the key handling is production-shaped:
+
+- `POST /portal/register` issues a key that **expires** after
+  `ISSUED_KEY_TTL_SECONDS` (default 30 days) and works on every API endpoint,
+  exactly like the built-in `alice`/`bob` keys.
+- Issued keys are **persisted in Redis** when `REDIS_URL`/Upstash is configured
+  (so they survive restarts and are shared across workers), falling back to
+  in-memory otherwise — same model as the job store.
+- Registration is **rate-limited** per client IP and per email
+  (`PORTAL_REGISTER_MAX_PER_WINDOW` per `PORTAL_REGISTER_WINDOW_SECONDS`).
+- `DELETE /portal/key` lets a holder **revoke** their own issued key.
 
 ## No SQL — structured query parameters
 
@@ -242,7 +250,8 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 |--------|-------------------------------------|------|------------------------------------------------|
 | GET    | `/`                                 | —    | Service info                                   |
 | GET    | `/portal`                           | —    | Researcher portal (web UI)                     |
-| POST   | `/portal/register`                  | —    | Issue a demo API key (`{name, email}`)         |
+| POST   | `/portal/register`                  | —    | Issue a demo API key (`{name, email}`) — rate-limited, expiring |
+| DELETE | `/portal/key`                       | key  | Revoke your own portal-issued key              |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
 | GET    | `/fields`                           | key  | List queryable fields and operations           |
@@ -375,6 +384,10 @@ All tuneable values are read from environment variables at startup:
 | `API_KEYS_JSON` | `alice` / `bob` demo keys | JSON object: `{"<key>": {"name": "<name>"}, …}` |
 | `DOWNLOAD_URL_SECRET` | _(random per process)_ | HMAC secret for signing download URLs — set a stable value in production |
 | `DOWNLOAD_URL_TTL_SECONDS` | `3600` | How long a signed download URL stays valid |
+| `ISSUED_KEY_TTL_SECONDS` | `2592000` | Lifetime of a portal-issued API key (30 days) |
+| `PORTAL_REGISTER_MAX_PER_WINDOW` | `10` | Max registrations per IP/email per window |
+| `PORTAL_REGISTER_WINDOW_SECONDS` | `3600` | Registration rate-limit window |
+| `TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` for the client IP (set only behind a trusted proxy) |
 
 Copy `.env.example` to `.env` and edit before running Docker Compose.
 

@@ -16,6 +16,7 @@ The following items are **complete** — no further code changes required:
 | Health endpoints | `GET /healthz` (liveness) and `GET /readyz` (checks DB connection) |
 | Smoke tests | 19 tests covering auth, query lifecycle, job isolation, write rejection, and delete. Run with `pytest` — no Redis required |
 | seed.py data path | `--source` / `--db` flags so seeding works outside the sibling-repo layout |
+| Portal key handling | Portal-issued keys (`/portal/register`) persist in Redis when configured (survive restarts, shared across workers), expire after `ISSUED_KEY_TTL_SECONDS`, are registration-rate-limited per IP/email, and are revocable via `DELETE /portal/key`. Open registration still needs real auth (SSO) before public exposure. |
 | `.env.example` | Documents every config variable |
 
 ---

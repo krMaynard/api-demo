@@ -54,3 +54,6 @@ _conn.close()
 
 os.environ.setdefault("DB_PATH", _DB)
 os.environ.setdefault("API_KEYS_JSON", '{"alice":{"name":"alice"},"bob":{"name":"bob"}}')
+# Don't let portal registration rate-limiting interfere with the HTTP tests
+# (they all share one TestClient IP). The limiter logic is unit-tested directly.
+os.environ.setdefault("PORTAL_REGISTER_MAX_PER_WINDOW", "10000")

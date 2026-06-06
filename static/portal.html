@@ -101,6 +101,7 @@
     </div>
     <p class="hint">Send it on every request as the <code>X-API-Key</code> header. Try it in the
       <a href="/docs" target="_blank" rel="noopener">interactive API docs</a>.</p>
+    <p class="hint" id="expires"></p>
   </section>
 
   <!-- Step 3: schema -->
@@ -188,6 +189,10 @@ $("#login-form").addEventListener("submit", async (e) => {
     apiKey = data.api_key;
     $("#who").textContent = data.name;
     $("#apikey").textContent = apiKey;
+    if (data.expires_at) {
+      const d = new Date(data.expires_at);
+      $("#expires").textContent = "Expires " + d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" }) + ".";
+    }
     show($("#key-card"));
     await loadSchema();
   } catch (err) {

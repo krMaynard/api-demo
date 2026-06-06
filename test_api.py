@@ -68,9 +68,23 @@ class TestPortal:
         key = body["api_key"]
         assert key.startswith("rk_")
         assert body["name"] == "Ada Lovelace"
+        assert "expires_at" in body
         # The issued key authenticates real API calls.
         assert client.get("/fields", headers={"X-API-Key": key}).status_code == 200
         assert client.get("/tables", headers={"X-API-Key": key}).status_code == 200
+
+    def test_issued_key_can_be_revoked(self):
+        key = client.post(
+            "/portal/register", json={"name": "Grace", "email": "grace@navy.mil"}
+        ).json()["api_key"]
+        hdr = {"X-API-Key": key}
+        assert client.get("/fields", headers=hdr).status_code == 200
+        assert client.delete("/portal/key", headers=hdr).json()["revoked"] is True
+        # Revoked key no longer authenticates.
+        assert client.get("/fields", headers=hdr).status_code == 401
+
+    def test_configured_key_cannot_be_revoked(self):
+        assert client.delete("/portal/key", headers=ALICE).status_code == 400
 
     def test_register_bad_email_is_400(self):
         r = client.post("/portal/register", json={"name": "Ada", "email": "not-an-email"})
@@ -85,6 +99,71 @@ class TestPortal:
 
     def test_unknown_issued_key_rejected(self):
         assert client.get("/fields", headers={"X-API-Key": "rk_deadbeef"}).status_code == 401
+
+    def test_register_rate_limited(self):
+        # Use an isolated store + a low limit so we exercise the 429 path without
+        # polluting the shared TestClient IP bucket the other tests rely on.
+        import main
+
+        original_store, original_limit = main._key_store, main.REGISTER_MAX_PER_WINDOW
+        main._key_store = main.MemoryKeyStore()
+        main.REGISTER_MAX_PER_WINDOW = 3
+        try:
+            statuses = [
+                client.post("/portal/register", json={"name": f"R{i}", "email": f"r{i}@x.org"}).status_code
+                for i in range(5)
+            ]
+            assert statuses == [201, 201, 201, 429, 429]
+        finally:
+            main._key_store, main.REGISTER_MAX_PER_WINDOW = original_store, original_limit
+
+
+class TestKeyStore:
+    def test_expiry_and_delete(self):
+        from main import MemoryKeyStore
+
+        s = MemoryKeyStore()
+        s.put("k1", {"name": "a"}, ttl=100)
+        assert s.get("k1") == {"name": "a"}
+        s.put("k2", {"name": "b"}, ttl=-1)  # already expired
+        assert s.get("k2") is None
+        assert s.delete("k1") is True
+        assert s.get("k1") is None
+        assert s.delete("missing") is False
+
+    def test_incr_counts_within_window(self):
+        from main import MemoryKeyStore
+
+        s = MemoryKeyStore()
+        assert [s.incr("b", 60) for _ in range(3)] == [1, 2, 3]
+        assert s.incr("other", 60) == 1  # buckets are independent
+
+    def test_incr_prunes_stale_buckets(self):
+        from main import MemoryKeyStore
+
+        s = MemoryKeyStore()
+        s._hits["old"] = [0.0]  # a bucket whose only hit is far outside any window
+        s._last_sweep = 0.0
+        s.incr("new", 60)  # triggers the lazy sweep
+        assert "old" not in s._hits and "new" in s._hits
+
+    def test_client_ip_respects_trust_flag(self):
+        import main
+
+        class Req:
+            def __init__(self, xff, host):
+                self.headers = {"x-forwarded-for": xff} if xff else {}
+                self.client = type("C", (), {"host": host})()
+
+        original = main.TRUST_PROXY_HEADERS
+        try:
+            main.TRUST_PROXY_HEADERS = False  # XFF ignored (spoofable) by default
+            assert main._client_ip(Req("1.2.3.4", "10.0.0.1")) == "10.0.0.1"
+            main.TRUST_PROXY_HEADERS = True  # trust the proxy's first hop
+            assert main._client_ip(Req("1.2.3.4, 5.6.7.8", "10.0.0.1")) == "1.2.3.4"
+            assert main._client_ip(Req(None, "10.0.0.1")) == "10.0.0.1"
+        finally:
+            main.TRUST_PROXY_HEADERS = original
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────

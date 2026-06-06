@@ -41,10 +41,10 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
@@ -66,6 +66,15 @@ JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "86400"))
 # aren't shared across workers — set DOWNLOAD_URL_SECRET in any real deployment.
 DOWNLOAD_URL_SECRET = os.getenv("DOWNLOAD_URL_SECRET") or secrets.token_hex(32)
 DOWNLOAD_URL_TTL = int(os.getenv("DOWNLOAD_URL_TTL_SECONDS", "3600"))
+# Researcher-portal issued keys: how long they last, and how many a single
+# client/email may mint within a rolling window.
+ISSUED_KEY_TTL = int(os.getenv("ISSUED_KEY_TTL_SECONDS", str(30 * 24 * 3600)))
+REGISTER_MAX_PER_WINDOW = int(os.getenv("PORTAL_REGISTER_MAX_PER_WINDOW", "10"))
+REGISTER_WINDOW = int(os.getenv("PORTAL_REGISTER_WINDOW_SECONDS", "3600"))
+# Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
+# overwrites it. Off by default: trusting it unconditionally would let any client
+# spoof the header to dodge the registration rate limit.
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -78,19 +87,12 @@ def _load_api_keys() -> dict[str, dict[str, str]]:
 
 API_KEYS = _load_api_keys()
 
-# Keys issued at runtime by the demo researcher portal (see /portal). Kept in a
-# separate in-memory map so they don't mutate the configured key set. Like the
-# in-memory job store, this is per-process — fine for the demo; a real portal
-# would persist these in the secret store / database.
-_issued_keys: dict[str, dict[str, str]] = {}
-_issued_lock = threading.Lock()
-
 
 def _lookup_principal(key: str) -> dict[str, str] | None:
+    """Resolve a key to its principal: a configured key, or an issued portal key."""
     if key in API_KEYS:
         return API_KEYS[key]
-    with _issued_lock:
-        return _issued_keys.get(key)
+    return _key_store.get(key)  # None if unknown or expired
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -340,18 +342,106 @@ class RedisJobStore:
         return [j for jid in job_ids if (j := self.get(jid)) is not None]
 
 
-def _make_store() -> MemoryJobStore | RedisJobStore:
+def _make_redis_client() -> Any | None:
+    """Build a redis-py / upstash-redis client from env, or None for in-memory mode."""
     if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
         from upstash_redis import Redis as UpstashRedis
-        client = UpstashRedis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-        return RedisJobStore(client)
+        return UpstashRedis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
     if REDIS_URL:
         import redis
-        return RedisJobStore(redis.from_url(REDIS_URL, decode_responses=True))
-    return MemoryJobStore()
+        return redis.from_url(REDIS_URL, decode_responses=True)
+    return None
 
 
+# ── Issued-key store (researcher portal) ───────────────────────────────────────
+#
+# Keys minted by /portal/register, with expiry and a registration rate limiter.
+# Backed by the same Redis client as the job store when configured, so issued
+# keys survive restarts and are shared across workers; otherwise in-memory.
+
+
+class MemoryKeyStore:
+    """Single-process store for issued keys + rate-limit counters."""
+
+    def __init__(self) -> None:
+        self._recs: dict[str, dict[str, Any]] = {}
+        self._exp: dict[str, float] = {}
+        self._hits: dict[str, list[float]] = {}
+        self._last_sweep = 0.0
+        self._lock = threading.Lock()
+
+    def put(self, key: str, record: dict[str, Any], ttl: int) -> None:
+        with self._lock:
+            self._recs[key] = record
+            self._exp[key] = time.time() + ttl
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            exp = self._exp.get(key)
+            if exp is None:
+                return None
+            if exp < time.time():  # expired — drop it
+                self._recs.pop(key, None)
+                self._exp.pop(key, None)
+                return None
+            return self._recs.get(key)
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            self._exp.pop(key, None)
+            return self._recs.pop(key, None) is not None
+
+    def incr(self, bucket: str, window: int) -> int:
+        """Count hits for `bucket` within the trailing `window` seconds."""
+        with self._lock:
+            now = time.time()
+            cutoff = now - window
+            # Lazily drop fully-stale buckets (at most once per window) so the
+            # dict doesn't grow unbounded with one entry per IP/email ever seen.
+            if now - self._last_sweep > window:
+                self._hits = {b: ts for b, ts in self._hits.items() if ts and ts[-1] > cutoff}
+                self._last_sweep = now
+            hits = [t for t in self._hits.get(bucket, []) if t > cutoff]
+            hits.append(now)
+            self._hits[bucket] = hits
+            return len(hits)
+
+
+class RedisKeyStore:
+    """Redis-backed issued-key store; expiry via key TTL, rate limit via INCR+EXPIRE."""
+
+    def __init__(self, client: Any) -> None:
+        self._r = client
+
+    def put(self, key: str, record: dict[str, Any], ttl: int) -> None:
+        self._r.set(f"issued_key:{key}", json.dumps(record), ex=ttl)
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        raw = self._r.get(f"issued_key:{key}")
+        return json.loads(raw) if raw else None
+
+    def delete(self, key: str) -> bool:
+        return bool(self._r.delete(f"issued_key:{key}"))
+
+    def incr(self, bucket: str, window: int) -> int:
+        rk = f"reg_rate:{bucket}"
+        n = int(self._r.incr(rk))
+        if n == 1:
+            self._r.expire(rk, window)
+        return n
+
+
+def _make_store() -> MemoryJobStore | RedisJobStore:
+    return RedisJobStore(_redis) if _redis is not None else MemoryJobStore()
+
+
+def _make_key_store() -> MemoryKeyStore | RedisKeyStore:
+    return RedisKeyStore(_redis) if _redis is not None else MemoryKeyStore()
+
+
+_redis = _make_redis_client()
 _store: MemoryJobStore | RedisJobStore = _make_store()
+_key_store: MemoryKeyStore | RedisKeyStore = _make_key_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
 
 app = FastAPI(
@@ -706,7 +796,8 @@ def root() -> dict[str, Any]:
         "auth": "X-API-Key header required for all endpoints except `/`, `/docs`, `/openapi.json`",
         "endpoints": {
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
-            "POST /portal/register": "Issue a demo API key for a researcher",
+            "POST /portal/register": "Issue a demo API key for a researcher (rate-limited, expiring)",
+            "DELETE /portal/key": "Revoke your portal-issued key",
             "POST /query": "Submit a structured query, returns 202 + job_id",
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
@@ -739,6 +830,18 @@ class RegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=254, description="Contact email.")
 
 
+def _client_ip(request: Request) -> str:
+    """The caller's IP. Honours X-Forwarded-For only when TRUST_PROXY_HEADERS is set
+    (i.e. a trusted proxy that overwrites it) — otherwise it's client-spoofable.
+    With `uvicorn --proxy-headers --forwarded-allow-ips=…`, request.client.host is
+    already correct and this flag isn't needed."""
+    if TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.get("/portal", response_class=HTMLResponse)
 def portal_page() -> FileResponse:
     """Serve the researcher portal single-page app."""
@@ -749,7 +852,7 @@ def portal_page() -> FileResponse:
 
 
 @app.post("/portal/register", status_code=201)
-def portal_register(body: RegisterRequest) -> dict[str, Any]:
+def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
     """Issue a demo API key for a researcher (no real authentication)."""
     name = body.name.strip()
     email = body.email.strip()
@@ -757,16 +860,41 @@ def portal_register(body: RegisterRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Name cannot be empty.")
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+
+    # Throttle minting by client IP and by email so the open endpoint can't be
+    # used to flood the key store.
+    for bucket in (f"ip:{_client_ip(request)}", f"email:{email.lower()}"):
+        if _key_store.incr(bucket, REGISTER_WINDOW) > REGISTER_MAX_PER_WINDOW:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many registrations from here. Please try again later.",
+            )
+
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=ISSUED_KEY_TTL)).isoformat()
     key = "rk_" + secrets.token_hex(16)
-    principal = {"name": name, "email": email}
-    with _issued_lock:
-        _issued_keys[key] = principal
+    _key_store.put(
+        key,
+        {"name": name, "email": email, "created_at": now.isoformat(), "expires_at": expires_at},
+        ISSUED_KEY_TTL,
+    )
     return {
         "api_key": key,
-        "name": principal["name"],
+        "name": name,
+        "expires_at": expires_at,
         "header": "X-API-Key",
         "note": "Pass this key in the X-API-Key header on every request. Demo key — not for production.",
     }
+
+
+@app.delete("/portal/key")
+def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
+    """Revoke the calling portal-issued key (configured demo keys can't be revoked)."""
+    key = principal["key"]
+    if key in API_KEYS:
+        raise HTTPException(status_code=400, detail="Configured keys cannot be revoked here.")
+    _key_store.delete(key)
+    return {"revoked": True}
 
 
 @app.get("/healthz")

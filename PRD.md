@@ -128,7 +128,10 @@ queued → running → done
 | ID | Requirement |
 |----|-------------|
 | F-26 | `GET /portal` serves a single-page web UI (no API key) where a researcher signs in with a name + email. |
-| F-27 | `POST /portal/register` (`{name, email}`) issues a working demo API key (`rk_…`) stored in an in-memory map; the key authenticates every other endpoint via the same `X-API-Key` mechanism. Invalid email → `400`; missing fields → `422`. This is a demo onboarding flow — no real authentication; production would use SSO and persist keys. |
+| F-27 | `POST /portal/register` (`{name, email}`) issues a working API key (`rk_…`) that authenticates every other endpoint via the same `X-API-Key` mechanism. Empty/whitespace name or invalid email → `400`; missing fields → `422`. No real authentication — production would use SSO. |
+| F-27a | Issued keys are stored in an issued-key store (Redis when configured — surviving restarts and shared across workers — else in-memory), with an expiry of `ISSUED_KEY_TTL_SECONDS` (default 30 days, returned as `expires_at`). |
+| F-27b | Registration is rate-limited per client IP and per email: more than `PORTAL_REGISTER_MAX_PER_WINDOW` (default 10) within `PORTAL_REGISTER_WINDOW_SECONDS` (default 3600) → `429`. |
+| F-27c | `DELETE /portal/key` revokes the calling portal-issued key (configured demo keys → `400`); a revoked key no longer authenticates. |
 | F-28 | After issuing the key, the portal page loads and displays the dataset schema (queryable dimensions/measures from `/fields`, and each table's columns from `/tables` + `/schema/{table}`) using the issued key. |
 
 ---
