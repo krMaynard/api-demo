@@ -6,6 +6,26 @@ and serves the results back as JSON or CSV. Backed by a read-only SQLite
 database seeded from the **Google Government Content Removals** dataset
 (`../krMaynard.github.io/data/google-government-removals.json`).
 
+## Demo walkthrough
+
+The full `demo.py` walkthrough — auth, discovery, structured query, polling,
+result, secure download, validation, and isolation:
+
+![Full walkthrough](docs/gifs/full.gif)
+
+### Main steps
+
+| Submit a structured query | Poll until done |
+|---|---|
+| ![Submit](docs/gifs/step-05-submit-a-structured-query-post-query-ret.gif) | ![Poll](docs/gifs/step-06-poll-get-jobs-job-id-until-status-done.gif) |
+| **Fetch the result (JSON)** | **Secure download — signed URL, no API key** |
+| ![Result](docs/gifs/step-07-fetch-the-result-as-json.gif) | ![Download](docs/gifs/step-08-secure-download-signed-url-no-api-key.gif) |
+| **Discover queryable fields** | **Invalid query → 400 (no arbitrary SQL)** |
+| ![Fields](docs/gifs/step-04-discover-the-queryable-fields-get-fields.gif) | ![Invalid](docs/gifs/step-10-invalid-query-400-no-sql-no-unknown-fiel.gif) |
+
+A GIF for every step lives in [`docs/gifs/`](docs/gifs/). They're generated
+headlessly from `demo.py` — see [Regenerating the showcase GIFs](#regenerating-the-showcase-gifs).
+
 ## No SQL — structured query parameters
 
 Clients never send SQL. They describe what they want with structured
@@ -369,6 +389,27 @@ pytest test_api.py -v
 
 No running server or Redis needed — the test suite uses FastAPI's in-process
 `TestClient` and a temporary SQLite database created in `conftest.py`.
+
+## Regenerating the showcase GIFs
+
+The GIFs in [`docs/gifs/`](docs/gifs/) are generated headlessly from `demo.py`
+— no `ffmpeg`, `ttyd`, or screen recorder needed. `scripts/make_gifs.py` seeds
+the DB if necessary, starts a temporary server, captures the demo's ANSI
+output, replays it through a [`pyte`](https://github.com/selectel/pyte)
+terminal emulator, and renders each step (plus a full walkthrough) to an
+animated GIF with Pillow.
+
+```bash
+pip install -r requirements-dev.txt   # adds pyte + Pillow
+make gifs                             # or: python scripts/make_gifs.py
+
+python scripts/make_gifs.py --only 5 8   # just steps 5 and 8 (+ full)
+python scripts/make_gifs.py --no-full    # per-step only
+```
+
+Per-step clips are detected from the demo's `── Step N:` headers, so they stay
+in sync with the script automatically — add a step to `demo.py` and it gets its
+own GIF on the next run.
 
 ## Safety notes
 

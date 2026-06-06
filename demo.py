@@ -11,12 +11,13 @@ Then run this script:
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("DEMO_BASE_URL", "http://127.0.0.1:8000")
 PAUSE = "--pause" in sys.argv
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
