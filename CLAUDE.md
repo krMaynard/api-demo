@@ -26,6 +26,7 @@ Built to demonstrate two things:
 | `main.py` | FastAPI app — all endpoints, job runner, in-memory job registry |
 | `seed.py` | Build `demo.db` from the source JSON in `../krMaynard.github.io/data/` |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
+| `scripts/make_gifs.py` | Headless showcase-GIF generator (pyte + Pillow) → `docs/gifs/` |
 | `requirements.txt` | `fastapi` + `uvicorn[standard]` |
 | `demo.db` | SQLite DB (git-ignored, produced by `seed.py`) |
 
