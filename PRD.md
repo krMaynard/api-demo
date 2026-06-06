@@ -11,11 +11,11 @@
 
 ### 1.1 Purpose
 
-`api-demo` is a FastAPI service that exposes a read-only SQLite database (seeded from the Google Government Content Removals dataset) as a queryable HTTP API. It is designed to demonstrate the **async-job / poll pattern** for long-running SQL queries without tying up HTTP connections.
+`api-demo` is a FastAPI service that exposes a read-only SQLite database (seeded from the Google Government Content Removals dataset) as a queryable HTTP API. Queries are described with **structured parameters** (a TikTok-Research-API-style boolean query, not SQL) and compiled server-side into a single parameterised SELECT. It is designed to demonstrate the **async-job / poll pattern** for long-running queries without tying up HTTP connections, behind a query interface that never executes caller-authored SQL.
 
 ### 1.2 Problem Statement
 
-Analysts and researchers who need to run ad-hoc SQL against shared datasets face two pain points:
+Analysts and researchers who need to run ad-hoc queries against shared datasets face two pain points:
 
 1. **Blocking HTTP** — long queries time out at proxies, load balancers, or client libraries before they complete.
 2. **No isolation** — without per-user job scoping, users can see (or interfere with) each other's work.
@@ -27,7 +27,7 @@ Analysts and researchers who need to run ad-hoc SQL against shared datasets face
 | Goal | Success Metric |
 |------|----------------|
 | Demonstrate the 202 + poll pattern clearly | Demo script (`demo.py`) runs end-to-end without errors |
-| Provide a safe, read-only SQL interface | Write attempts fail at the database layer; no SQL parsing required |
+| Provide a safe, no-SQL query interface | Queries are structured parameters compiled to parameterised SQL; arbitrary SQL cannot be submitted and injection is structurally impossible |
 | Scope jobs to the submitting user | A foreign job ID always returns 404, not the job's data |
 | Be horizontally scalable with minimal changes | Swap `REDIS_URL` env var to switch from in-memory to Redis backend |
 
@@ -87,10 +87,11 @@ A developer giving a live presentation who runs `demo.py --pause` to step throug
 
 | ID | Requirement |
 |----|-------------|
-| F-11 | `POST /query` accepts a JSON body `{"sql": "<query>"}` and returns `202 Accepted` immediately with a job object and a `Location` header pointing to the job status URL. |
-| F-12 | The submitted query is queued and executed on a background thread pool. The caller does not block waiting for execution. |
-| F-13 | If the query result exceeds `ROW_LIMIT` rows (default 100,000), the job fails with a descriptive error asking the caller to add a `LIMIT` clause. |
-| F-14 | Write operations (INSERT, UPDATE, DELETE, CREATE, DROP, etc.) are rejected by SQLite (database opened read-only). The job fails with the SQLite error message. No SQL parsing is required. |
+| F-11 | `POST /query` accepts a structured JSON body (a boolean `query` of `and`/`or`/`not` conditions, plus optional `fields`, `group_by`, `aggregates`, `sort`, `max_count`) — **never raw SQL**. On a valid query it returns `202 Accepted` immediately with a job object and a `Location` header pointing to the job status URL. |
+| F-11a | The request is validated against a fixed field registry and compiled into a single parameterised SELECT (`compile_query`). All values are bound as parameters. Invalid queries (unknown field, illegal operation for a field type, bad aggregate alias, sort over a non-output column) are rejected synchronously with `400 Bad Request` and never become jobs. `GET /fields` documents the queryable dimensions, measures, and operations. |
+| F-12 | The compiled query is queued and executed on a background thread pool. The caller does not block waiting for execution. |
+| F-13 | If the query result exceeds `ROW_LIMIT` rows (default 100,000), the job fails with a descriptive error asking the caller to lower `max_count`. |
+| F-14 | Caller-authored SQL cannot be submitted at all, so there is no write/DDL path. As defence in depth the database is still opened read-only, so even a compiler bug could not mutate it. |
 
 ### 3.5 Job Lifecycle
 
@@ -206,7 +207,8 @@ Indexes exist on all foreign key columns in `removals` to accelerate joins.
 ```
 Job {
   id:            UUID (hex)
-  sql:           string
+  sql:           string        # compiled parameterised SELECT (internal)
+  params:        list           # bound parameters for the compiled SQL
   owner_key:     string        # API key (not exposed in responses)
   submitted_by:  string        # Display name from key metadata
   status:        enum { queued | running | done | failed | cancelled }
@@ -232,7 +234,12 @@ POST /query
 X-API-Key: alice
 Content-Type: application/json
 
-{"sql": "SELECT country_id, SUM(items_requested) AS total FROM removals GROUP BY 1 ORDER BY 2 DESC LIMIT 5"}
+{
+  "group_by": ["country_name"],
+  "aggregates": [{"function": "SUM", "field_name": "items_requested", "alias": "total"}],
+  "sort": [{"field_name": "total", "order": "desc"}],
+  "max_count": 5
+}
 ```
 
 **Response `202 Accepted`:**

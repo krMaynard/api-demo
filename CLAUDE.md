@@ -2,14 +2,22 @@
 
 ## What this is
 
-A FastAPI demo service that accepts SQL queries via HTTP, runs them
-asynchronously on background worker threads, and returns results as JSON or
-CSV. Backed by a read-only SQLite database seeded from the Google Government
-Content Removals dataset.
+A FastAPI demo service that accepts **structured query parameters** (not SQL)
+via HTTP, runs the resulting query asynchronously on background worker threads,
+and returns results as JSON or CSV. Backed by a read-only SQLite database
+seeded from the Google Government Content Removals dataset.
 
-Built to demonstrate the **async-job / poll pattern**: `POST /query` returns
-`202 + job_id` immediately; the client polls `/jobs/{id}` until `status=done`,
-then fetches `/jobs/{id}/result`.
+Built to demonstrate two things:
+
+1. The **async-job / poll pattern**: `POST /query` returns `202 + job_id`
+   immediately; the client polls `/jobs/{id}` until `status=done`, then
+   fetches `/jobs/{id}/result`.
+2. A **safe, no-SQL query interface** modelled on the TikTok Research API:
+   boolean `and`/`or`/`not` clauses of `{operation, field_name, field_values}`,
+   plus `group_by`, `aggregates`, `sort`, and `max_count`. The server
+   validates everything against a fixed field registry and compiles it into a
+   single parameterised SELECT (`compile_query` in `main.py`). Arbitrary SQL is
+   never accepted or executed.
 
 ## Repo layout
 
@@ -66,10 +74,28 @@ Star schema seeded from `google-government-removals.json`:
 - **`products`** — YouTube, Web Search, Maps, …
 - **`reasons`** — Defamation, National Security, Privacy, …
 
-The DB is opened `mode=ro` — any write attempt surfaces as `status=failed`.
+The DB is opened `mode=ro` as defence in depth.
+
+## Query model
+
+Requests are structured (see `QueryRequest`/`compile_query` in `main.py`):
+
+- **Dimensions** (text, `EQ`/`IN`): `period_label`, `country_code`,
+  `country_name`, `requestor_name`, `product_name`, `reason_name`.
+- **Measures** (numeric, `EQ`/`IN`/`GT`/`GTE`/`LT`/`LTE`): `num_requests`,
+  `items_requested`, `removed_legal`, `removed_policy`, `not_found`,
+  `not_enough_info`, `no_action`, `already_removed`.
+- **Aggregates**: `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a measure, with an alias.
+- `group_by`, `sort`, `max_count`. `GET /fields` documents all of this.
+
+`compile_query` is the single trust boundary — keep all field/operation
+validation there, and never build SQL by interpolating user values (always
+bind with `?`).
 
 ## Key design decisions
 
+- **Structured params, not SQL**: the only way to query is the validated
+  parameter model, compiled to one parameterised SELECT — no caller SQL runs.
 - **202 + polling** instead of blocking HTTP: lets long queries run without
   tying up connections or timing out at proxies.
 - **In-memory job registry** (`_jobs` dict + `threading.Lock`): simple for a
@@ -96,9 +122,10 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | GET | `/` | — | Service info |
+| GET | `/fields` | key | Queryable fields + operations |
 | GET | `/tables` | key | List tables |
 | GET | `/schema/{table}` | key | Column info |
-| POST | `/query` | key | Submit SQL → 202 + job_id |
+| POST | `/query` | key | Submit structured query → 202 + job_id |
 | GET | `/jobs` | key | List your jobs |
 | GET | `/jobs/{id}` | key | Job status |
 | GET | `/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |
