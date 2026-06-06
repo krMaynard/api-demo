@@ -3,6 +3,7 @@
 conftest.py sets up a temp SQLite DB and env vars before main is imported.
 No Redis required — the in-memory store is used automatically.
 """
+import re
 import time
 
 import pytest
@@ -186,6 +187,69 @@ class TestQueryLifecycle:
         r = client.get("/jobs", headers=ALICE)
         assert r.status_code == 200
         assert len(r.json()["jobs"]) >= 1
+
+
+# ── Secure download URLs ──────────────────────────────────────────────────────
+
+class TestSecureDownload:
+    def test_done_job_exposes_signed_download_urls(self):
+        job = _submit_and_wait(COUNT_ALL)
+        urls = job["download_urls"]
+        assert set(urls) == {"json", "csv"}
+        for u in urls.values():
+            assert "sig=" in u and "expires=" in u
+
+    def test_download_without_api_key_works(self):
+        job = _submit_and_wait(COUNT_ALL)
+        url = job["download_urls"]["json"]
+        # No X-API-Key header — the signed URL is the capability.
+        r = client.get(url)
+        assert r.status_code == 200
+        assert r.json()["rows"][0][0] == 3
+        assert "attachment" in r.headers.get("content-disposition", "")
+
+    def test_download_csv_without_api_key_works(self):
+        job = _submit_and_wait(COUNT_ALL)
+        r = client.get(job["download_urls"]["csv"])
+        assert r.status_code == 200
+        assert "text/csv" in r.headers["content-type"]
+
+    def test_tampered_signature_is_403(self):
+        job = _submit_and_wait(COUNT_ALL)
+        url = job["download_urls"]["json"]
+        tampered = url[:-1] + ("0" if url[-1] != "0" else "1")
+        assert client.get(tampered).status_code == 403
+
+    def test_tampered_expiry_is_403(self):
+        job = _submit_and_wait(COUNT_ALL)
+        url = job["download_urls"]["json"]
+        # Extending the expiry without re-signing breaks the signature.
+        bumped = re.sub(r"expires=\d+", "expires=99999999999", url)
+        assert client.get(bumped).status_code == 403
+
+    def test_expired_link_is_410(self):
+        from main import _make_download_url, _store
+
+        job = _submit_and_wait(COUNT_ALL)
+        job_id = job["job_id"]
+        owner_key = _store.get(job_id).owner_key
+        # Forge a correctly-signed but already-expired link.
+        expires = 1
+        from main import _download_signature
+
+        sig = _download_signature(job_id, owner_key, "json", expires)
+        r = client.get(f"/jobs/{job_id}/download?format=json&expires={expires}&sig={sig}")
+        assert r.status_code == 410
+
+    def test_signature_bound_to_format(self):
+        job = _submit_and_wait(COUNT_ALL)
+        # Take the json URL but swap the declared format to csv — signature no longer matches.
+        url = job["download_urls"]["json"].replace("format=json", "format=csv")
+        assert client.get(url).status_code == 403
+
+    def test_unknown_job_download_is_404(self):
+        r = client.get("/jobs/doesnotexist/download?format=json&expires=99999999999&sig=abc")
+        assert r.status_code == 404
 
 
 # ── Job isolation ─────────────────────────────────────────────────────────────

@@ -178,6 +178,15 @@ def main() -> None:
     _step("Fetch the result as JSON")
     get(f"/jobs/{job_id}/result?format=json", key="alice")
 
+    # 7b. Secure download via a signed, expiring URL — no API key needed
+    _step("Secure download — signed URL, no API key")
+    _note("A done job exposes download_urls: capability links signed with HMAC.")
+    _note("We fetch the link from the job status, then download it WITHOUT a key.")
+    _, status = get(f"/jobs/{job_id}", key="alice")
+    dl_url = status["download_urls"]["json"]
+    print(f"  {DIM}download_url = {dl_url}{RESET}")
+    get(dl_url)  # note: no key= — the signature alone authorises the download
+
     # 8. Job isolation
     _step("Job isolation — bob cannot see alice's job")
     _note("Foreign job IDs return 404 (not 403) so existence isn't leaked.")

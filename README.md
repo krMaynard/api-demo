@@ -212,6 +212,7 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | GET    | `/jobs`                             | key  | List **your** jobs                             |
 | GET    | `/jobs/{job_id}`                    | key  | Job status (your jobs only)                    |
 | GET    | `/jobs/{job_id}/result?format=…`    | key  | Result rows (only when `status=done`)          |
+| GET    | `/jobs/{job_id}/download?…`          | —    | Secure result download via a signed, expiring URL |
 | DELETE | `/jobs/{job_id}`                    | key  | Cancel a running job, or remove a finished one |
 
 ## Job statuses
@@ -227,6 +228,45 @@ synchronously with `400` at `POST /query` and never become jobs.
 
 `DELETE` while running calls SQLite's `interrupt()` to abort the in-flight
 query, then drops the job from the registry.
+
+## Secure download URLs
+
+When a job reaches `status=done`, its job object includes a `download_urls`
+map with a signed, expiring link for each format:
+
+```jsonc
+{
+  "status": "done",
+  "result_url": "/jobs/<id>/result",
+  "download_urls": {
+    "json": "/jobs/<id>/download?format=json&expires=1780767547&sig=ff9e1b…",
+    "csv":  "/jobs/<id>/download?format=csv&expires=1780767547&sig=3f1e4e…"
+  }
+}
+```
+
+These are **capability URLs** (like an S3 presigned link): the `sig` is an
+HMAC-SHA256 over the job id, owner, format, and expiry, so the link
+authorises that exact download and nothing else. `GET /jobs/{id}/download`
+therefore needs **no `X-API-Key`** — possession of a valid, unexpired URL is
+sufficient — and serves the result as a file attachment. You can hand the URL
+to a browser, a `curl` without headers, or a download manager.
+
+```bash
+# Fetch the signed CSV link from the job status, then download with no key:
+URL=$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['download_urls']['csv'])")
+curl -OJ "http://127.0.0.1:8000$URL"     # writes <job_id>.csv
+```
+
+Tampering with the URL (changing the job id, format, or expiry) invalidates
+the signature → `403`; an expired link → `410`. Links last
+`DOWNLOAD_URL_TTL_SECONDS` (default 1 h). The `/result` endpoint (API-key
+auth) remains available for clients that prefer header auth.
+
+> **Production note:** set `DOWNLOAD_URL_SECRET` to a stable secret. The
+> zero-config default is a random per-process key, so signed links would
+> otherwise break on restart and wouldn't validate across multiple workers.
 
 ## Schema (Google Government Content Removals)
 
@@ -291,6 +331,8 @@ All tuneable values are read from environment variables at startup:
 | `REDIS_URL` | _(unset — uses memory)_ | Redis connection URL for persistent job storage |
 | `JOB_TTL_SECONDS` | `86400` | How long to retain jobs in Redis (24 h) |
 | `API_KEYS_JSON` | `alice` / `bob` demo keys | JSON object: `{"<key>": {"name": "<name>"}, …}` |
+| `DOWNLOAD_URL_SECRET` | _(random per process)_ | HMAC secret for signing download URLs — set a stable value in production |
+| `DOWNLOAD_URL_TTL_SECONDS` | `3600` | How long a signed download URL stays valid |
 
 Copy `.env.example` to `.env` and edit before running Docker Compose.
 
@@ -338,6 +380,9 @@ No running server or Redis needed — the test suite uses FastAPI's in-process
   compiler couldn't write to it.
 - Per-job results are capped at `ROW_LIMIT` rows (default 100k); over that the
   job fails and the client is asked to lower `max_count`.
+- Download URLs are signed capabilities: the HMAC binds job id, owner, format,
+  and expiry, so a link can't be tampered with or repointed and stops working
+  after `DOWNLOAD_URL_TTL_SECONDS`. Set `DOWNLOAD_URL_SECRET` in production.
 - When `REDIS_URL` is set, jobs and results persist across restarts and are
   shared across multiple processes. Without it, everything lives in memory
   and a restart clears all jobs.

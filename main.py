@@ -23,13 +23,21 @@ Configuration (environment variables):
     UPSTASH_REDIS_REST_TOKEN  Upstash REST token} instead of REDIS_URL
     JOB_TTL_SECONDS        how long to retain completed jobs in Redis (default: 86400)
     API_KEYS_JSON          JSON object mapping key→{name:str}; falls back to demo keys
+    DOWNLOAD_URL_SECRET    HMAC secret for signing secure download URLs
+                           (default: a random per-process secret — set this in
+                           production so links survive restarts and span workers)
+    DOWNLOAD_URL_TTL_SECONDS  how long a signed download URL stays valid (default: 3600)
 """
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -51,6 +59,11 @@ REDIS_URL = os.getenv("REDIS_URL")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "86400"))
+# Secret for signing capability-style download URLs. A random per-process
+# default keeps the demo zero-config, but signed links then break on restart and
+# aren't shared across workers — set DOWNLOAD_URL_SECRET in any real deployment.
+DOWNLOAD_URL_SECRET = os.getenv("DOWNLOAD_URL_SECRET") or secrets.token_hex(32)
+DOWNLOAD_URL_TTL = int(os.getenv("DOWNLOAD_URL_TTL_SECONDS", "3600"))
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -75,6 +88,35 @@ def require_api_key(key: str | None = Depends(api_key_header)) -> dict[str, str]
             detail="Missing or invalid API key. Set header `X-API-Key: <key>`.",
         )
     return {"key": key, **API_KEYS[key]}
+
+
+# ── Secure download URLs ──────────────────────────────────────────────────────
+#
+# A finished job exposes a capability-style download URL: a signed, expiring link
+# that streams the result without an API key (like an S3 presigned URL). The
+# signature binds the job id, owner, format, and expiry with HMAC-SHA256, so the
+# link can't be tampered with or repointed at another job, and stops working
+# once it expires.
+
+DOWNLOAD_FORMATS = ("json", "csv")
+
+
+def _download_signature(job_id: str, owner_key: str, fmt: str, expires: int) -> str:
+    msg = f"{job_id}:{owner_key}:{fmt}:{expires}".encode()
+    return hmac.new(DOWNLOAD_URL_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def _make_download_url(job_id: str, owner_key: str, fmt: str) -> str:
+    expires = int(time.time()) + DOWNLOAD_URL_TTL
+    sig = _download_signature(job_id, owner_key, fmt, expires)
+    return f"/jobs/{job_id}/download?format={fmt}&expires={expires}&sig={sig}"
+
+
+def _verify_download_signature(
+    job_id: str, owner_key: str, fmt: str, expires: int, sig: str
+) -> bool:
+    expected = _download_signature(job_id, owner_key, fmt, expires)
+    return hmac.compare_digest(expected, sig)
 
 
 # ── Job model ─────────────────────────────────────────────────────────────────
@@ -113,6 +155,12 @@ class Job:
             "compiled_sql": self.sql,
             "status_url": f"/jobs/{self.id}",
             "result_url": f"/jobs/{self.id}/result" if self.status == "done" else None,
+            # Signed, expiring links that download the result without an API key.
+            "download_urls": (
+                {fmt: _make_download_url(self.id, self.owner_key, fmt) for fmt in DOWNLOAD_FORMATS}
+                if self.status == "done"
+                else None
+            ),
         }
 
 
@@ -643,6 +691,7 @@ def root() -> dict[str, Any]:
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
             "GET /jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
+            "GET /jobs/{job_id}/download?...": "Secure result download via a signed, expiring URL (no key)",
             "DELETE /jobs/{job_id}": "Cancel a queued/running job, or remove a finished one",
             "GET /fields": "List queryable fields and operations",
             "GET /tables": "List tables in the demo database",
@@ -766,6 +815,34 @@ def get_job(job_id: str, principal: dict = Depends(require_api_key)) -> dict[str
     return _job_for_owner(job_id, principal["key"]).to_public()
 
 
+def _render_result(
+    job_id: str, fmt: str, *, as_attachment: bool
+) -> JSONResponse | PlainTextResponse:
+    """Fetch a done job's result and render it as JSON or CSV (404 if it's gone)."""
+    result = _store.get_result(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Result not found (may have expired).")
+    cols, rows = result
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(cols)
+        writer.writerows(rows)
+        return PlainTextResponse(
+            buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'},
+        )
+
+    headers = (
+        {"Content-Disposition": f'attachment; filename="{job_id}.json"'} if as_attachment else None
+    )
+    return JSONResponse(
+        {"columns": cols, "rows": rows, "row_count": len(rows)}, headers=headers
+    )
+
+
 @app.get("/jobs/{job_id}/result", response_model=None)
 def get_job_result(
     job_id: str,
@@ -778,23 +855,38 @@ def get_job_result(
             status_code=409,
             detail=f"Job not ready (status={job.status}). Poll {job.id} again.",
         )
+    return _render_result(job_id, format, as_attachment=False)
 
-    result = _store.get_result(job_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Result not found (may have expired).")
-    cols, rows = result
 
-    if format == "csv":
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(cols)
-        writer.writerows(rows)
-        return PlainTextResponse(
-            buf.getvalue(),
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'},
+@app.get("/jobs/{job_id}/download", response_model=None)
+def download_job_result(
+    job_id: str,
+    expires: int,
+    sig: str,
+    format: Literal["json", "csv"] = "json",
+) -> JSONResponse | PlainTextResponse:
+    """Secure download via a signed, expiring URL — no API key needed.
+
+    The link is a capability: the HMAC signature authorises this exact job +
+    format + expiry, so possession of a valid, unexpired URL is sufficient.
+    """
+    job = _store.get(job_id)
+    # Bind the signature to the job's owner; if the job is gone, there's nothing
+    # to verify against, so treat it as a 404 either way.
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    if not _verify_download_signature(job_id, job.owner_key, format, expires, sig):
+        raise HTTPException(status_code=403, detail="Invalid download signature.")
+    if expires < int(time.time()):
+        raise HTTPException(status_code=410, detail="Download link has expired.")
+
+    if job.status != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job not ready (status={job.status}).",
         )
-    return JSONResponse({"columns": cols, "rows": rows, "row_count": len(rows)})
+    return _render_result(job_id, format, as_attachment=True)
 
 
 @app.delete("/jobs/{job_id}")

@@ -120,6 +120,8 @@ queued → running → done
 | F-21 | CSV format: standard RFC 4180 CSV with a header row. Response `Content-Type` is `text/csv`. |
 | F-22 | If the job is not yet done, the endpoint returns `409 Conflict` with the current status. |
 | F-23 | If the result has expired from the store, the endpoint returns `404` with a message indicating expiry. |
+| F-24 | A `done` job's status object includes `download_urls` (`json` and `csv`): signed, expiring **capability URLs** for the result. The signature is an HMAC-SHA256 over `job_id:owner_key:format:expires` using `DOWNLOAD_URL_SECRET`. |
+| F-25 | `GET /jobs/{id}/download?format=…&expires=…&sig=…` serves the result as a file attachment **without an API key** — the valid signature is the authorisation. Tampering (job id, format, or expiry) yields `403`; an expired link yields `410`; a missing job yields `404`; a not-yet-done job yields `409`. Link lifetime is `DOWNLOAD_URL_TTL_SECONDS` (default 3600). |
 
 ---
 
