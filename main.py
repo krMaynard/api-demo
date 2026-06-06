@@ -71,6 +71,10 @@ DOWNLOAD_URL_TTL = int(os.getenv("DOWNLOAD_URL_TTL_SECONDS", "3600"))
 ISSUED_KEY_TTL = int(os.getenv("ISSUED_KEY_TTL_SECONDS", str(30 * 24 * 3600)))
 REGISTER_MAX_PER_WINDOW = int(os.getenv("PORTAL_REGISTER_MAX_PER_WINDOW", "10"))
 REGISTER_WINDOW = int(os.getenv("PORTAL_REGISTER_WINDOW_SECONDS", "3600"))
+# Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
+# overwrites it. Off by default: trusting it unconditionally would let any client
+# spoof the header to dodge the registration rate limit.
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -363,6 +367,7 @@ class MemoryKeyStore:
         self._recs: dict[str, dict[str, Any]] = {}
         self._exp: dict[str, float] = {}
         self._hits: dict[str, list[float]] = {}
+        self._last_sweep = 0.0
         self._lock = threading.Lock()
 
     def put(self, key: str, record: dict[str, Any], ttl: int) -> None:
@@ -390,7 +395,13 @@ class MemoryKeyStore:
         """Count hits for `bucket` within the trailing `window` seconds."""
         with self._lock:
             now = time.time()
-            hits = [t for t in self._hits.get(bucket, []) if t > now - window]
+            cutoff = now - window
+            # Lazily drop fully-stale buckets (at most once per window) so the
+            # dict doesn't grow unbounded with one entry per IP/email ever seen.
+            if now - self._last_sweep > window:
+                self._hits = {b: ts for b, ts in self._hits.items() if ts and ts[-1] > cutoff}
+                self._last_sweep = now
+            hits = [t for t in self._hits.get(bucket, []) if t > cutoff]
             hits.append(now)
             self._hits[bucket] = hits
             return len(hits)
@@ -819,6 +830,18 @@ class RegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=254, description="Contact email.")
 
 
+def _client_ip(request: Request) -> str:
+    """The caller's IP. Honours X-Forwarded-For only when TRUST_PROXY_HEADERS is set
+    (i.e. a trusted proxy that overwrites it) — otherwise it's client-spoofable.
+    With `uvicorn --proxy-headers --forwarded-allow-ips=…`, request.client.host is
+    already correct and this flag isn't needed."""
+    if TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.get("/portal", response_class=HTMLResponse)
 def portal_page() -> FileResponse:
     """Serve the researcher portal single-page app."""
@@ -839,9 +862,8 @@ def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
 
     # Throttle minting by client IP and by email so the open endpoint can't be
-    # used to flood the key store. (Behind a proxy, trust X-Forwarded-For instead.)
-    client_ip = request.client.host if request.client else "unknown"
-    for bucket in (f"ip:{client_ip}", f"email:{email.lower()}"):
+    # used to flood the key store.
+    for bucket in (f"ip:{_client_ip(request)}", f"email:{email.lower()}"):
         if _key_store.incr(bucket, REGISTER_WINDOW) > REGISTER_MAX_PER_WINDOW:
             raise HTTPException(
                 status_code=429,

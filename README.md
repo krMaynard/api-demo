@@ -387,6 +387,7 @@ All tuneable values are read from environment variables at startup:
 | `ISSUED_KEY_TTL_SECONDS` | `2592000` | Lifetime of a portal-issued API key (30 days) |
 | `PORTAL_REGISTER_MAX_PER_WINDOW` | `10` | Max registrations per IP/email per window |
 | `PORTAL_REGISTER_WINDOW_SECONDS` | `3600` | Registration rate-limit window |
+| `TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` for the client IP (set only behind a trusted proxy) |
 
 Copy `.env.example` to `.env` and edit before running Docker Compose.
 

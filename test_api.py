@@ -138,6 +138,33 @@ class TestKeyStore:
         assert [s.incr("b", 60) for _ in range(3)] == [1, 2, 3]
         assert s.incr("other", 60) == 1  # buckets are independent
 
+    def test_incr_prunes_stale_buckets(self):
+        from main import MemoryKeyStore
+
+        s = MemoryKeyStore()
+        s._hits["old"] = [0.0]  # a bucket whose only hit is far outside any window
+        s._last_sweep = 0.0
+        s.incr("new", 60)  # triggers the lazy sweep
+        assert "old" not in s._hits and "new" in s._hits
+
+    def test_client_ip_respects_trust_flag(self):
+        import main
+
+        class Req:
+            def __init__(self, xff, host):
+                self.headers = {"x-forwarded-for": xff} if xff else {}
+                self.client = type("C", (), {"host": host})()
+
+        original = main.TRUST_PROXY_HEADERS
+        try:
+            main.TRUST_PROXY_HEADERS = False  # XFF ignored (spoofable) by default
+            assert main._client_ip(Req("1.2.3.4", "10.0.0.1")) == "10.0.0.1"
+            main.TRUST_PROXY_HEADERS = True  # trust the proxy's first hop
+            assert main._client_ip(Req("1.2.3.4, 5.6.7.8", "10.0.0.1")) == "1.2.3.4"
+            assert main._client_ip(Req(None, "10.0.0.1")) == "10.0.0.1"
+        finally:
+            main.TRUST_PROXY_HEADERS = original
+
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
