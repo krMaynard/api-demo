@@ -98,33 +98,22 @@ These are ordered by priority — stop when you've reached the level of hardenin
 
 #### Rate limiting
 
-A single key can pin all worker threads with expensive queries.
-
-```python
-# pip install slowapi
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
-limiter = Limiter(key_func=lambda req: req.headers.get("X-API-Key", get_remote_address(req)))
-
-@app.post("/query")
-@limiter.limit("60/minute")
-def submit_query(...): ...
-```
-
-Alternatively, handle at the nginx / Caddy / API Gateway layer.
+`POST /query` is throttled per API key (`QUERY_RATE_MAX_PER_WINDOW` per
+`QUERY_RATE_WINDOW_SECONDS`, default 60/60s) using the same counter primitive as
+portal registration — over-limit requests get `429` + a `Retry-After` header
+before any job is spawned. The counter is Redis-backed when configured (shared
+across workers) and in-memory otherwise. For multi-endpoint or burst policies
+you may still want an edge limiter (nginx / Caddy / API Gateway) or `slowapi`.
 
 #### Structured logging
 
-Add JSON logs so you can query them in CloudWatch / Datadog / Loki:
-
-```python
-# pip install structlog
-import structlog
-log = structlog.get_logger()
-log.info("job.submitted", job_id=job.id, key=principal["key"], sql_length=len(body.sql))
-log.info("job.done",      job_id=job.id, row_count=len(rows), elapsed_s=elapsed)
-```
+JSON logs are emitted out of the box (`LOG_FORMAT=json`, the default; set
+`LOG_FORMAT=text` for human-readable lines). Each HTTP request logs method,
+path, status, `duration_ms`, and a `request_id` (also returned as the
+`X-Request-ID` response header); the job runner logs `job_submitted` /
+`job_started` / `job_done` / `job_failed` with `job_id`, row count, and
+`duration_ms`. API keys are never logged. Point your collector
+(CloudWatch / Datadog / Loki) at stdout.
 
 ### Priority 2 — Once you have users
 

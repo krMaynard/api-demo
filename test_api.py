@@ -3,6 +3,7 @@
 conftest.py sets up a temp SQLite DB and env vars before main is imported.
 No Redis required — the in-memory store is used automatically.
 """
+import json
 import re
 import time
 
@@ -489,3 +490,71 @@ class TestDelete:
         assert r.status_code == 200
         assert r.json()["deleted"] is True
         assert client.get(f"/jobs/{job_id}", headers=ALICE).status_code == 404
+
+
+# ── Query rate limiting ─────────────────────────────────────────────────────────
+
+class TestQueryRateLimit:
+    def test_over_limit_returns_429_with_retry_after(self):
+        import main
+
+        original_store, original_max = main._key_store, main.QUERY_RATE_MAX
+        main._key_store = main.MemoryKeyStore()  # isolated, so it doesn't affect other tests
+        main.QUERY_RATE_MAX = 2
+        try:
+            statuses = [client.post("/query", json=COUNT_ALL, headers=ALICE).status_code for _ in range(4)]
+            assert statuses == [202, 202, 429, 429]
+            r = client.post("/query", json=COUNT_ALL, headers=ALICE)
+            assert r.status_code == 429 and r.headers["Retry-After"] == str(main.QUERY_RATE_WINDOW)
+        finally:
+            main._key_store, main.QUERY_RATE_MAX = original_store, original_max
+
+    def test_limit_is_per_key(self):
+        import main
+
+        original_store, original_max = main._key_store, main.QUERY_RATE_MAX
+        main._key_store = main.MemoryKeyStore()
+        main.QUERY_RATE_MAX = 1
+        try:
+            assert client.post("/query", json=COUNT_ALL, headers=ALICE).status_code == 202
+            assert client.post("/query", json=COUNT_ALL, headers=ALICE).status_code == 429
+            # bob has his own bucket and is unaffected
+            assert client.post("/query", json=COUNT_ALL, headers=BOB).status_code == 202
+        finally:
+            main._key_store, main.QUERY_RATE_MAX = original_store, original_max
+
+
+# ── Structured logging ──────────────────────────────────────────────────────────
+
+class TestLogging:
+    def test_json_formatter_emits_event_and_data(self):
+        import logging
+
+        from main import JsonLogFormatter
+
+        rec = logging.LogRecord("api_demo", logging.INFO, __file__, 1, "job_done", None, None)
+        rec.data = {"job_id": "abc", "rows": 5}
+        line = json.loads(JsonLogFormatter().format(rec))
+        assert line["event"] == "job_done"
+        assert line["level"] == "INFO"
+        assert line["job_id"] == "abc" and line["rows"] == 5
+        assert "ts" in line
+
+    def test_json_formatter_includes_exception(self):
+        import logging
+        import sys
+
+        from main import JsonLogFormatter
+
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            rec = logging.LogRecord(
+                "api_demo", logging.ERROR, __file__, 1, "request_error", None, sys.exc_info()
+            )
+        line = json.loads(JsonLogFormatter().format(rec))
+        assert "boom" in line["exc"]
+
+    def test_request_emits_request_id_header(self):
+        r = client.get("/healthz")
+        assert re.fullmatch(r"[0-9a-f]{16}", r.headers["X-Request-ID"])

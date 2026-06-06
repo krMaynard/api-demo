@@ -92,6 +92,7 @@ A developer giving a live presentation who runs `demo.py --pause` to step throug
 | F-12 | The compiled query is queued and executed on a background thread pool. The caller does not block waiting for execution. |
 | F-13 | If the query result exceeds `ROW_LIMIT` rows (default 100,000), the job fails with a descriptive error asking the caller to lower `max_count`. |
 | F-14 | Caller-authored SQL cannot be submitted at all, so there is no write/DDL path. As defence in depth the database is still opened read-only, so even a compiler bug could not mutate it. |
+| F-15 | `POST /query` is rate-limited per API key: more than `QUERY_RATE_MAX_PER_WINDOW` (default 60) submissions within `QUERY_RATE_WINDOW_SECONDS` (default 60) → `429` with a `Retry-After` header, before a job is created. Limits are independent per key. |
 
 ### 3.5 Job Lifecycle
 
@@ -173,6 +174,7 @@ queued → running → done
 | ID | Requirement |
 |----|-------------|
 | NF-11 | `/healthz` and `/readyz` are suitable as Kubernetes liveness and readiness probes respectively. |
+| NF-11a | The service emits structured logs (JSON by default, `LOG_FORMAT=text` for humans): one line per HTTP request with method, path, status, `duration_ms`, and a `request_id` (returned as the `X-Request-ID` header), plus `job_submitted`/`job_started`/`job_done`/`job_failed` events with `job_id`, row count, and `duration_ms`. API keys are never logged. |
 | NF-12 | All timestamps are UTC ISO 8601 strings. |
 | NF-13 | The service is 12-factor: all tunables (DB path, row limit, worker count, TTL, auth keys, Redis URL) are environment variables with sensible defaults. |
 

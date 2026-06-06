@@ -54,6 +54,8 @@ _conn.close()
 
 os.environ.setdefault("DB_PATH", _DB)
 os.environ.setdefault("API_KEYS_JSON", '{"alice":{"name":"alice"},"bob":{"name":"bob"}}')
-# Don't let portal registration rate-limiting interfere with the HTTP tests
-# (they all share one TestClient IP). The limiter logic is unit-tested directly.
+# Don't let the rate limiters interfere with the HTTP tests (they share one
+# TestClient IP / API key). The 429 paths are exercised with isolated stores.
 os.environ.setdefault("PORTAL_REGISTER_MAX_PER_WINDOW", "10000")
+os.environ.setdefault("QUERY_RATE_MAX_PER_WINDOW", "100000")
+os.environ.setdefault("LOG_FORMAT", "text")  # readable pytest output

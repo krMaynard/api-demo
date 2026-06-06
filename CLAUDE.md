@@ -121,6 +121,15 @@ bind with `?`).
   in-flight query without parsing SQL.
 - **100k row cap**: queries returning more rows fail with a helpful error
   asking the caller to add a `LIMIT`.
+- **Per-key query rate limit**: `POST /query` is throttled per API key
+  (`QUERY_RATE_MAX`/`QUERY_RATE_WINDOW`, default 60/60s) via `_key_store.incr` —
+  the same counter primitive as portal registration. Over-limit → `429` +
+  `Retry-After`, before a job is created.
+- **Structured logging**: a dedicated `api_demo` logger emits JSON lines
+  (`JsonLogFormatter`, `LOG_FORMAT=json` default; `text` for humans). An HTTP
+  middleware logs each request (method/path/status/`duration_ms`/`request_id`,
+  echoed as `X-Request-ID`); the job runner logs `job_submitted`/`job_started`/
+  `job_done`/`job_failed`. Pass fields via `extra={"data": {...}}`; never log keys.
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
 

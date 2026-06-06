@@ -27,12 +27,17 @@ Configuration (environment variables):
                            (default: a random per-process secret — set this in
                            production so links survive restarts and span workers)
     DOWNLOAD_URL_TTL_SECONDS  how long a signed download URL stays valid (default: 3600)
+    QUERY_RATE_MAX_PER_WINDOW  max POST /query submissions per API key per window (default: 60)
+    QUERY_RATE_WINDOW_SECONDS  the query rate-limit window in seconds (default: 60)
+    LOG_LEVEL             log level for the api_demo logger (default: INFO)
+    LOG_FORMAT            json (default) for structured logs, or text for human-readable
 """
 import csv
 import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -75,6 +80,51 @@ REGISTER_WINDOW = int(os.getenv("PORTAL_REGISTER_WINDOW_SECONDS", "3600"))
 # overwrites it. Off by default: trusting it unconditionally would let any client
 # spoof the header to dodge the registration rate limit.
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
+# Per-API-key throttle on query submission (the expensive, job-spawning path).
+QUERY_RATE_MAX = int(os.getenv("QUERY_RATE_MAX_PER_WINDOW", "60"))
+QUERY_RATE_WINDOW = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
+# Structured logging: JSON lines by default, or LOG_FORMAT=text for humans.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = os.getenv("LOG_FORMAT", "json").lower()
+
+
+# ── Structured logging ──────────────────────────────────────────────────────────
+#
+# One JSON object per line (event + context), so logs are greppable in dev and
+# ingestible by a log pipeline in prod. Pass structured fields via
+# `logger.info("event_name", extra={"data": {...}})`. Secrets (API keys) are
+# never logged. Set LOG_FORMAT=text for plain human-readable lines.
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "event": record.getMessage(),
+        }
+        data = getattr(record, "data", None)
+        if isinstance(data, dict):
+            payload.update(data)
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def _configure_logging() -> logging.Logger:
+    handler = logging.StreamHandler()
+    if LOG_FORMAT == "json":
+        handler.setFormatter(JsonLogFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log = logging.getLogger("api_demo")
+    log.handlers[:] = [handler]
+    log.setLevel(LOG_LEVEL)
+    log.propagate = False  # don't double-emit through uvicorn's root handler
+    return log
+
+
+logger = _configure_logging()
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -456,6 +506,39 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Emit one structured log line per request with method, path, status, and latency."""
+    start = time.perf_counter()
+    request_id = secrets.token_hex(8)
+    request.state.request_id = request_id
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "request_error",
+            extra={"data": {
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+            }},
+        )
+        raise
+    logger.info(
+        "request",
+        extra={"data": {
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+        }},
+    )
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 # ── Structured query model (TikTok-Research-API-style) ─────────────────────────
 #
 # Clients never send SQL. They describe what they want; the server validates
@@ -735,6 +818,11 @@ def _execute_job(job_id: str) -> None:
         return
 
     _store.update_fields(job_id, status="running", started_at=_now())
+    started = time.perf_counter()
+    logger.info("job_started", extra={"data": {"job_id": job_id, "user": job.submitted_by}})
+
+    def _elapsed_ms() -> float:
+        return round((time.perf_counter() - started) * 1000, 2)
 
     try:
         conn = _connect_ro()
@@ -759,12 +847,20 @@ def _execute_job(job_id: str) -> None:
 
         _store.save_result(job_id, cols, [list(r) for r in rows])
         _store.update_fields(job_id, status="done", finished_at=_now())
+        logger.info(
+            "job_done",
+            extra={"data": {"job_id": job_id, "rows": len(rows), "duration_ms": _elapsed_ms()}},
+        )
 
     except sqlite3.OperationalError as exc:
         refreshed = _store.get(job_id)
         if refreshed and refreshed.status != "cancelled":
             _store.update_fields(
                 job_id, status="failed", error=f"SQL error: {exc}", finished_at=_now()
+            )
+            logger.warning(
+                "job_failed",
+                extra={"data": {"job_id": job_id, "error": f"SQL error: {exc}", "duration_ms": _elapsed_ms()}},
             )
     except Exception as exc:
         refreshed = _store.get(job_id)
@@ -774,6 +870,10 @@ def _execute_job(job_id: str) -> None:
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
                 finished_at=_now(),
+            )
+            logger.warning(
+                "job_failed",
+                extra={"data": {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}", "duration_ms": _elapsed_ms()}},
             )
 
 
@@ -978,6 +1078,14 @@ def submit_query(
     response: Response,
     principal: dict = Depends(require_api_key),
 ) -> dict[str, Any]:
+    # Throttle the expensive job-spawning path per API key.
+    if _key_store.incr(f"query:{principal['key']}", QUERY_RATE_WINDOW) > QUERY_RATE_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Query rate limit exceeded ({QUERY_RATE_MAX}/{QUERY_RATE_WINDOW}s). Slow down.",
+            headers={"Retry-After": str(QUERY_RATE_WINDOW)},
+        )
+
     try:
         sql, params, _columns = compile_query(body)
     except QueryCompileError as exc:
@@ -992,6 +1100,7 @@ def submit_query(
     )
     _store.put(job)
     _executor.submit(_execute_job, job.id)
+    logger.info("job_submitted", extra={"data": {"job_id": job.id, "user": principal["name"]}})
     response.headers["Location"] = f"/jobs/{job.id}"
     return job.to_public()
 

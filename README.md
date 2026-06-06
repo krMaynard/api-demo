@@ -369,6 +369,25 @@ Star schema — one fact table plus five small dimension tables:
 }
 ```
 
+## Rate limiting & logging
+
+`POST /query` spawns background work, so it's throttled per API key — by default
+60 submissions per 60 s (`QUERY_RATE_MAX_PER_WINDOW` / `QUERY_RATE_WINDOW_SECONDS`).
+Over the limit returns `429` with a `Retry-After` header, before any job is
+created. The counter shares the Redis-backed (or in-memory) store used for portal
+registration limits, so it holds across workers when Redis is configured.
+
+Logs are structured JSON by default (`LOG_FORMAT=json`; use `text` for
+human-readable lines). Every request logs `method`, `path`, `status`,
+`duration_ms`, and a `request_id` — also returned as the `X-Request-ID` response
+header so clients can correlate. The job runner logs `job_submitted` /
+`job_started` / `job_done` / `job_failed` with `job_id`, row count, and
+`duration_ms`. API keys are never logged.
+
+```json
+{"ts": "2026-06-06T22:30:00+00:00", "level": "INFO", "event": "job_done", "job_id": "f68b…", "rows": 1, "duration_ms": 11.97}
+```
+
 ## Configuration
 
 All tuneable values are read from environment variables at startup:
@@ -388,6 +407,10 @@ All tuneable values are read from environment variables at startup:
 | `PORTAL_REGISTER_MAX_PER_WINDOW` | `10` | Max registrations per IP/email per window |
 | `PORTAL_REGISTER_WINDOW_SECONDS` | `3600` | Registration rate-limit window |
 | `TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` for the client IP (set only behind a trusted proxy) |
+| `QUERY_RATE_MAX_PER_WINDOW` | `60` | Max `POST /query` submissions per API key per window |
+| `QUERY_RATE_WINDOW_SECONDS` | `60` | Query rate-limit window |
+| `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
+| `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |
 
 Copy `.env.example` to `.env` and edit before running Docker Compose.
 
