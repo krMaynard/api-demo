@@ -609,3 +609,46 @@ class TestLogging:
         finally:
             main.logger.removeHandler(handler)
         assert "request_error" in buf.getvalue()
+
+
+# ── Prometheus metrics ──────────────────────────────────────────────────────────
+
+class TestMetrics:
+    def test_metrics_endpoint_exposes_prometheus_text(self):
+        client.get("/healthz")  # generate at least one request sample
+        r = client.get("/metrics")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/plain")
+        body = r.text
+        # Metric families are declared even before first use.
+        for name in (
+            "api_demo_http_requests_total",
+            "api_demo_http_request_duration_seconds",
+            "api_demo_jobs_in_flight",
+            "api_demo_jobs_total",
+            "api_demo_job_queue_depth",
+        ):
+            assert name in body
+
+    def test_request_counter_uses_route_template_not_raw_path(self):
+        # A job id in the URL must not leak into label cardinality.
+        job = _submit_and_wait(COUNT_ALL)
+        client.get(f"/jobs/{job['job_id']}", headers=ALICE)
+        body = client.get("/metrics").text
+        assert 'path="/jobs/{job_id}"' in body
+        assert job["job_id"] not in body  # the literal id is never a label value
+
+    def test_job_completion_increments_jobs_total(self):
+        from prometheus_client import REGISTRY
+
+        before = REGISTRY.get_sample_value("api_demo_jobs_total", {"status": "done"}) or 0.0
+        _submit_and_wait(COUNT_ALL)
+        after = REGISTRY.get_sample_value("api_demo_jobs_total", {"status": "done"})
+        assert after is not None and after >= before + 1
+
+    def test_queue_depth_balances_to_zero_at_rest(self):
+        from prometheus_client import REGISTRY
+
+        # inc on submit / dec on pickup should net to zero once the job is done.
+        _submit_and_wait(COUNT_ALL)
+        assert REGISTRY.get_sample_value("api_demo_job_queue_depth") == 0.0

@@ -254,6 +254,7 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | DELETE | `/portal/key`                       | key  | Revoke your own portal-issued key              |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
+| GET    | `/metrics`                          | —    | Prometheus metrics (scrape over internal net)  |
 | GET    | `/fields`                           | key  | List queryable fields and operations           |
 | GET    | `/tables`                           | key  | List tables                                    |
 | GET    | `/schema/{table}`                   | key  | Show a table's columns                         |
@@ -386,6 +387,20 @@ header so clients can correlate. The job runner logs `job_submitted` /
 
 ```json
 {"ts": "2026-06-06T22:30:00+00:00", "level": "INFO", "event": "job_done", "job_id": "f68b…", "rows": 1, "duration_ms": 11.97}
+```
+
+`GET /metrics` exposes Prometheus metrics (no auth — scrape it over an internal
+network). Request metrics are labelled by the **matched route template**, so job
+ids never explode label cardinality:
+
+- `api_demo_http_requests_total{method, path, status}`
+- `api_demo_http_request_duration_seconds{method, path}` (histogram)
+- `api_demo_jobs_in_flight` / `api_demo_job_queue_depth` (gauges)
+- `api_demo_jobs_total{status}` (`done` / `failed`)
+
+```
+api_demo_http_requests_total{method="GET",path="/jobs/{job_id}",status="200"} 1.0
+api_demo_jobs_total{status="done"} 1.0
 ```
 
 ## Configuration

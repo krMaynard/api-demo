@@ -136,16 +136,14 @@ The read-only connection already blocks writes. Add on top:
 
 #### Metrics
 
-```bash
-pip install prometheus-fastapi-instrumentator
-```
-
-```python
-from prometheus_fastapi_instrumentator import Instrumentator
-Instrumentator().instrument(app).expose(app)
-```
-
-Exposes `/metrics` in Prometheus format. Add custom gauges for `jobs_in_flight` and `job_queue_depth`.
+Shipped: `GET /metrics` exposes Prometheus metrics via `prometheus-client`
+(no auth — scrape over an internal network). The request middleware records
+`api_demo_http_requests_total` and `api_demo_http_request_duration_seconds`
+labelled by the matched **route template** (so job ids don't explode label
+cardinality), and the job runner exposes `api_demo_jobs_in_flight`,
+`api_demo_jobs_total{status}`, and `api_demo_job_queue_depth`. Wire it into a
+Prometheus scrape config / Grafana dashboard; add alert rules on
+`job_queue_depth` and the `failed` job rate.
 
 #### Result offload for large payloads
 

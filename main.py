@@ -52,6 +52,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -128,6 +129,23 @@ def _configure_logging() -> logging.Logger:
 
 
 logger = _configure_logging()
+
+
+# ── Prometheus metrics ──────────────────────────────────────────────────────────
+#
+# Exposed at GET /metrics (no auth — scrape it over an internal network). Request
+# metrics are labelled by the matched *route template* (e.g. "/jobs/{job_id}"),
+# not the raw path, so job ids don't blow up label cardinality.
+
+HTTP_REQUESTS = Counter(
+    "api_demo_http_requests_total", "HTTP requests", ["method", "path", "status"]
+)
+HTTP_LATENCY = Histogram(
+    "api_demo_http_request_duration_seconds", "HTTP request latency", ["method", "path"]
+)
+JOBS_IN_FLIGHT = Gauge("api_demo_jobs_in_flight", "Jobs currently executing")
+JOBS_TOTAL = Counter("api_demo_jobs_total", "Jobs by terminal status", ["status"])
+JOB_QUEUE_DEPTH = Gauge("api_demo_job_queue_depth", "Queued jobs not yet started")
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -511,12 +529,14 @@ app = FastAPI(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Emit one structured log line per request with method, path, status, and latency."""
+    """Emit one structured log line + Prometheus metrics per request."""
     start = time.perf_counter()
     request_id = secrets.token_hex(8)
     request.state.request_id = request_id
+    status = 500
     try:
         response = await call_next(request)
+        status = response.status_code
     except Exception:
         logger.exception(
             "request_error",
@@ -528,14 +548,22 @@ async def log_requests(request: Request, call_next):
             }},
         )
         raise
+    finally:
+        # Label by route template ("/jobs/{job_id}") to bound cardinality; bare
+        # 404s (no matched route) collapse into "unmatched".
+        route = request.scope.get("route")
+        path_label = getattr(route, "path", None) or "unmatched"
+        elapsed = time.perf_counter() - start
+        HTTP_REQUESTS.labels(request.method, path_label, str(status)).inc()
+        HTTP_LATENCY.labels(request.method, path_label).observe(elapsed)
     logger.info(
         "request",
         extra={"data": {
             "request_id": request_id,
             "method": request.method,
             "path": request.url.path,
-            "status": response.status_code,
-            "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+            "status": status,
+            "duration_ms": round(elapsed * 1000, 2),
         }},
     )
     response.headers["X-Request-ID"] = request_id
@@ -816,6 +844,7 @@ def _connect_ro() -> sqlite3.Connection:
 
 
 def _execute_job(job_id: str) -> None:
+    JOB_QUEUE_DEPTH.dec()  # dequeued — now running (or about to early-return)
     job = _store.get(job_id)
     if job is None or job.status == "cancelled":
         return
@@ -827,6 +856,7 @@ def _execute_job(job_id: str) -> None:
     def _elapsed_ms() -> float:
         return round((time.perf_counter() - started) * 1000, 2)
 
+    JOBS_IN_FLIGHT.inc()
     try:
         conn = _connect_ro()
         with _active_conns_lock:
@@ -850,6 +880,7 @@ def _execute_job(job_id: str) -> None:
 
         _store.save_result(job_id, cols, [list(r) for r in rows])
         _store.update_fields(job_id, status="done", finished_at=_now())
+        JOBS_TOTAL.labels("done").inc()
         logger.info(
             "job_done",
             extra={"data": {"job_id": job_id, "rows": len(rows), "duration_ms": _elapsed_ms()}},
@@ -861,6 +892,7 @@ def _execute_job(job_id: str) -> None:
             _store.update_fields(
                 job_id, status="failed", error=f"SQL error: {exc}", finished_at=_now()
             )
+            JOBS_TOTAL.labels("failed").inc()
             logger.warning(
                 "job_failed",
                 extra={"data": {"job_id": job_id, "error": f"SQL error: {exc}", "duration_ms": _elapsed_ms()}},
@@ -874,11 +906,14 @@ def _execute_job(job_id: str) -> None:
                 error=f"{type(exc).__name__}: {exc}",
                 finished_at=_now(),
             )
+            JOBS_TOTAL.labels("failed").inc()
             # Unexpected failure — keep the traceback (JsonLogFormatter puts it in "exc").
             logger.exception(
                 "job_failed",
                 extra={"data": {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}", "duration_ms": _elapsed_ms()}},
             )
+    finally:
+        JOBS_IN_FLIGHT.dec()
 
 
 def _job_for_owner(job_id: str, owner_key: str) -> Job:
@@ -913,6 +948,7 @@ def root() -> dict[str, Any]:
             "GET /schema/{table}": "Show columns for a table",
             "GET /healthz": "Liveness probe",
             "GET /readyz": "Readiness probe (checks DB connection)",
+            "GET /metrics": "Prometheus metrics (no auth)",
             "GET /docs": "Interactive Swagger UI",
         },
         "row_limit": ROW_LIMIT,
@@ -1004,6 +1040,12 @@ def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
 @app.get("/healthz")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus metrics. No auth — scrape over an internal network only."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/readyz")
@@ -1103,6 +1145,7 @@ def submit_query(
         submitted_by=principal["name"],
     )
     _store.put(job)
+    JOB_QUEUE_DEPTH.inc()  # queued; decremented when _execute_job picks it up
     _executor.submit(_execute_job, job.id)
     logger.info("job_submitted", extra={"data": {"job_id": job.id, "user": principal["name"]}})
     response.headers["Location"] = f"/jobs/{job.id}"

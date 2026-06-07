@@ -175,6 +175,7 @@ queued → running → done
 |----|-------------|
 | NF-11 | `/healthz` and `/readyz` are suitable as Kubernetes liveness and readiness probes respectively. |
 | NF-11a | The service emits structured logs (JSON by default, `LOG_FORMAT=text` for humans): one line per HTTP request with method, path, status, `duration_ms`, and a `request_id` (returned as the `X-Request-ID` header), plus `job_submitted`/`job_started`/`job_done`/`job_failed` events with `job_id`, row count, and `duration_ms`. API keys are never logged. |
+| NF-11b | `GET /metrics` exposes Prometheus metrics (unauthenticated, intended for an internal scrape): request counts and latency histograms labelled by the matched route template (so path cardinality stays bounded), plus job gauges/counters (`api_demo_jobs_in_flight`, `api_demo_jobs_total{status}`, `api_demo_job_queue_depth`). |
 | NF-12 | All timestamps are UTC ISO 8601 strings. |
 | NF-13 | The service is 12-factor: all tunables (DB path, row limit, worker count, TTL, auth keys, Redis URL) are environment variables with sensible defaults. |
 

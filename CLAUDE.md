@@ -130,6 +130,12 @@ bind with `?`).
   middleware logs each request (method/path/status/`duration_ms`/`request_id`,
   echoed as `X-Request-ID`); the job runner logs `job_submitted`/`job_started`/
   `job_done`/`job_failed`. Pass fields via `extra={"data": {...}}`; never log keys.
+- **Prometheus metrics** at `GET /metrics` (no auth): the same request middleware
+  records `api_demo_http_requests_total` + `_http_request_duration_seconds`,
+  labelled by the **route template** (`/jobs/{job_id}`) to bound cardinality; the
+  job runner tracks `api_demo_jobs_in_flight`, `api_demo_jobs_total{status}`, and
+  `api_demo_job_queue_depth` (inc'd on submit, dec'd when the worker picks the job
+  up — no reliance on `ThreadPoolExecutor` internals).
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
 
@@ -167,3 +173,4 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 | GET | `/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |
 | GET | `/jobs/{id}/download?format=…&expires=…&sig=…` | signed URL | Secure download, no key needed |
 | DELETE | `/jobs/{id}` | key | Cancel or remove |
+| GET | `/metrics` | — | Prometheus metrics |
