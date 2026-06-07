@@ -143,26 +143,29 @@ def main() -> None:
     _note("Every data endpoint requires X-API-Key. Missing key returns 401.")
     get("/tables")  # no key
 
-    # 3. List tables
-    _step("List available tables  (key=alice)")
-    _note("Star schema: one removals fact table + five dimension tables.")
+    # 3. List the report tables
+    _step("List the queryable report tables  (GET /tables)")
+    _note("The dataset is the EU DSA VLOP transparency reports — one table per")
+    _note("DSA report table (t3–t11). A query names a `table`, then its fields.")
     get("/tables", key="alice")
 
-    # 4. Inspect the queryable fields
-    _step("Discover the queryable fields  (GET /fields)")
+    # 4. Inspect a table's fields
+    _step("Discover a table's fields  (GET /fields?table=t4_notices)")
     _note("Clients never send SQL — they pick from these fields and operations.")
     _note("Dimensions support EQ/IN; measures also support GT/GTE/LT/LTE.")
-    get("/fields", key="alice")
+    get("/fields?table=t4_notices", key="alice")
 
     # 5. Submit a query — the core pattern
     _step("Submit a structured query — POST /query returns 202 immediately")
     _note("The query is described with parameters (TikTok-Research-API style),")
     _note("compiled to a safe parameterised SELECT, and run on a background worker.")
-    _note("Query: top 5 countries by total items requested for removal.")
+    _note("Query: top 5 services by total Art. 16 notices received (t4_notices).")
     top5 = {
-        "group_by": ["country_name"],
-        "aggregates": [{"function": "SUM", "field_name": "items_requested", "alias": "items"}],
-        "sort": [{"field_name": "items", "order": "desc"}],
+        "table": "t4_notices",
+        "query": {"and": [{"operation": "EQ", "field_name": "category_code", "field_values": ["TOTAL"]}]},
+        "group_by": ["service_name"],
+        "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "notices"}],
+        "sort": [{"field_name": "notices", "order": "desc"}],
         "max_count": 5,
     }
     _, job = post("/query", top5, key="alice")
@@ -199,7 +202,7 @@ def main() -> None:
     _note("immediately — the request never becomes a job.")
     post(
         "/query",
-        {"query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
+        {"table": "t4_notices", "query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
         key="alice",
     )
 
@@ -214,16 +217,15 @@ def main() -> None:
     delete(f"/jobs/{job_id}", key="alice")
 
     # 12. Bonus: a filtered breakdown to show off the data
-    _step("Bonus query: defamation requests broken down by product")
-    defamation = {
-        "query": {
-            "and": [{"operation": "EQ", "field_name": "reason_name", "field_values": ["Defamation"]}]
-        },
-        "group_by": ["product_name"],
-        "aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "requests"}],
-        "sort": [{"field_name": "requests", "order": "desc"}],
+    _step("Bonus query: top services by Average Monthly Active Recipients (t10_amar)")
+    amar = {
+        "table": "t10_amar",
+        "group_by": ["service_name", "platform"],
+        "aggregates": [{"function": "MAX", "field_name": "value", "alias": "amar"}],
+        "sort": [{"field_name": "amar", "order": "desc"}],
+        "max_count": 10,
     }
-    _, j2 = post("/query", defamation, key="alice")
+    _, j2 = post("/query", amar, key="alice")
     j2_id: str = j2["job_id"]
     _poll(j2_id, key="alice")
     get(f"/jobs/{j2_id}/result?format=json", key="alice")

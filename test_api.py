@@ -16,8 +16,8 @@ client = TestClient(app)
 ALICE = {"X-API-Key": "alice"}
 BOB = {"X-API-Key": "bob"}
 
-# A trivial valid query: grand total row count (one row, one column "n").
-COUNT_ALL = {"aggregates": [{"function": "COUNT", "alias": "n"}]}
+# A trivial valid query: count rows in t4_notices (3 in the conftest fixture).
+COUNT_ALL = {"table": "t4_notices", "aggregates": [{"function": "COUNT", "alias": "n"}]}
 
 
 def _wait_for_job(job_id: str, headers: dict, timeout: float = 5.0) -> dict:
@@ -179,37 +179,49 @@ class TestAuth:
     def test_valid_key_ok(self):
         r = client.get("/tables", headers=ALICE)
         assert r.status_code == 200
-        assert "removals" in r.json()["tables"]
+        assert [t["name"] for t in r.json()["tables"]]
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 class TestSchema:
-    def test_known_table(self):
-        r = client.get("/schema/removals", headers=ALICE)
+    def test_tables_lists_report_tables(self):
+        r = client.get("/tables", headers=ALICE)
         assert r.status_code == 200
-        col_names = [c["name"] for c in r.json()["columns"]]
-        assert "num_requests" in col_names
+        body = r.json()
+        names = [t["name"] for t in body["tables"]]
+        assert "t4_notices" in names and "t11_qualitative" in names
+        assert body["period"] == "2025-07-01/2025-12-31"
+
+    def test_known_table_schema(self):
+        r = client.get("/schema/t4_notices", headers=ALICE)
+        assert r.status_code == 200
+        body = r.json()
+        assert "service_name" in body["dimensions"]["fields"]
+        assert "notices" in body["measures"]["fields"]
 
     def test_missing_table_is_404(self):
         assert client.get("/schema/nonexistent", headers=ALICE).status_code == 404
-
-    def test_invalid_table_name_is_400(self):
-        # Slashes are stripped by the router; test a name that reaches the handler
-        # but contains characters the isalnum guard rejects.
-        assert client.get("/schema/bad;name", headers=ALICE).status_code == 400
 
 
 # ── Fields discovery ──────────────────────────────────────────────────────────
 
 class TestFields:
-    def test_lists_dimensions_and_measures(self):
+    def test_overview_lists_tables(self):
         r = client.get("/fields", headers=ALICE)
         assert r.status_code == 200
+        assert "t4_notices" in r.json()["tables"]
+
+    def test_per_table_fields(self):
+        r = client.get("/fields?table=t4_notices", headers=ALICE)
+        assert r.status_code == 200
         body = r.json()
-        assert "country_code" in body["dimensions"]["fields"]
-        assert "items_requested" in body["measures"]["fields"]
+        assert "service_name" in body["dimensions"]["fields"]
+        assert "notices" in body["measures"]["fields"]
         assert "SUM" in body["aggregate_functions"]
+
+    def test_unknown_table_is_404(self):
+        assert client.get("/fields?table=nope", headers=ALICE).status_code == 404
 
     def test_fields_requires_auth(self):
         assert client.get("/fields").status_code == 401
@@ -237,57 +249,60 @@ class TestQueryLifecycle:
     def test_happy_path_csv(self):
         job = _submit_and_wait(
             {
-                "fields": ["country_name"],
-                "sort": [{"field_name": "country_name", "order": "asc"}],
+                "table": "t4_notices",
+                "fields": ["service_name"],
+                "sort": [{"field_name": "service_name", "order": "asc"}],
             }
         )
         r = client.get(f"/jobs/{job['job_id']}/result?format=csv", headers=ALICE)
         assert r.status_code == 200
         assert "text/csv" in r.headers["content-type"]
         lines = r.text.strip().splitlines()
-        assert lines[0] == "country_name"
-        assert "Germany" in lines
-        assert "United States" in lines
+        assert lines[0] == "service_name"
+        assert "YouTube" in lines
+        assert "Facebook" in lines
 
     def test_filter_group_and_aggregate(self):
-        # Items requested per country, US only — exercises filter + group + agg + sort.
+        # Notices per service, YouTube only — exercises filter + group + agg + sort.
         job = _submit_and_wait(
             {
+                "table": "t4_notices",
                 "query": {
                     "and": [
-                        {"operation": "EQ", "field_name": "country_code", "field_values": ["US"]}
+                        {"operation": "EQ", "field_name": "service_name", "field_values": ["YouTube"]}
                     ]
                 },
-                "group_by": ["country_name"],
+                "group_by": ["service_name"],
                 "aggregates": [
-                    {"function": "SUM", "field_name": "items_requested", "alias": "items"}
+                    {"function": "SUM", "field_name": "notices", "alias": "notices"}
                 ],
-                "sort": [{"field_name": "items", "order": "desc"}],
+                "sort": [{"field_name": "notices", "order": "desc"}],
             }
         )
         assert job["status"] == "done"
         r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         body = r.json()
-        assert body["columns"] == ["country_name", "items"]
-        # US rows in conftest: items 100 + 30 = 130.
-        assert body["rows"] == [["United States", 130]]
+        assert body["columns"] == ["service_name", "notices"]
+        # YouTube t4 rows in conftest: notices 100 + 40 = 140.
+        assert body["rows"] == [["YouTube", 140]]
 
     def test_compiled_sql_is_parameterised(self):
         r = client.post(
             "/query",
             json={
+                "table": "t4_notices",
                 "query": {
                     "and": [
-                        {"operation": "EQ", "field_name": "country_code", "field_values": ["US"]}
+                        {"operation": "EQ", "field_name": "service_name", "field_values": ["YouTube"]}
                     ]
                 }
             },
             headers=ALICE,
         )
         job = _wait_for_job(r.json()["job_id"], ALICE)
-        # Value is bound, not interpolated — the literal 'US' must not appear in the SQL.
+        # Value is bound, not interpolated — 'YouTube' must not appear in the SQL.
         assert "?" in job["compiled_sql"]
-        assert "US" not in job["compiled_sql"]
+        assert "YouTube" not in job["compiled_sql"]
 
     def test_result_before_done_is_409(self):
         r = client.post("/query", json=COUNT_ALL, headers=ALICE)
@@ -382,10 +397,27 @@ class TestJobIsolation:
 # ── Safety: no arbitrary SQL ──────────────────────────────────────────────────
 
 class TestSafety:
+    def test_missing_table_is_400(self):
+        r = client.post("/query", json={"aggregates": [{"function": "COUNT", "alias": "n"}]}, headers=ALICE)
+        assert r.status_code == 400
+
+    def test_unknown_table_is_400(self):
+        r = client.post("/query", json={"table": "t99_nope", "fields": ["service_name"]}, headers=ALICE)
+        assert r.status_code == 400
+
+    def test_field_from_other_table_is_400(self):
+        # `notices` belongs to t4, not t3 — it must not be accepted for t3.
+        r = client.post(
+            "/query",
+            json={"table": "t3_member_state_orders", "fields": ["notices"]},
+            headers=ALICE,
+        )
+        assert r.status_code == 400
+
     def test_unknown_field_is_400(self):
         r = client.post(
             "/query",
-            json={"query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
+            json={"table": "t4_notices", "query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
             headers=ALICE,
         )
         assert r.status_code == 400
@@ -393,7 +425,7 @@ class TestSafety:
     def test_comparator_on_text_field_is_400(self):
         r = client.post(
             "/query",
-            json={"query": {"and": [{"operation": "GT", "field_name": "country_name", "field_values": [5]}]}},
+            json={"table": "t4_notices", "query": {"and": [{"operation": "GT", "field_name": "service_name", "field_values": [5]}]}},
             headers=ALICE,
         )
         assert r.status_code == 400
@@ -401,7 +433,7 @@ class TestSafety:
     def test_bad_alias_is_400(self):
         r = client.post(
             "/query",
-            json={"aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "x); DROP"}]},
+            json={"table": "t4_notices", "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "x); DROP"}]},
             headers=ALICE,
         )
         assert r.status_code == 400
@@ -411,29 +443,32 @@ class TestSafety:
         # query runs successfully and simply matches nothing — it is never code.
         job = _submit_and_wait(
             {
+                "table": "t4_notices",
                 "query": {
                     "and": [
                         {
                             "operation": "EQ",
-                            "field_name": "country_code",
-                            "field_values": ["US'; DROP TABLE countries;--"],
+                            "field_name": "service_name",
+                            "field_values": ["YouTube'; DROP TABLE services;--"],
                         }
                     ]
-                }
+                },
             }
         )
         assert job["status"] == "done"
         r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         assert r.json()["row_count"] == 0
-        # Table still intact afterwards.
-        assert client.get("/tables", headers=ALICE).json()["tables"].count("countries") == 1
+        # DB still intact afterwards — a follow-up count still works.
+        again = _submit_and_wait(COUNT_ALL)
+        r2 = client.get(f"/jobs/{again['job_id']}/result?format=json", headers=ALICE)
+        assert r2.json()["rows"][0][0] == 3
 
     def test_dimension_requires_string(self):
         # A numeric value on a TEXT dimension would silently match nothing under
         # SQLite affinity rules, so it is rejected up front.
         r = client.post(
             "/query",
-            json={"query": {"and": [{"operation": "EQ", "field_name": "country_code", "field_values": [123]}]}},
+            json={"table": "t4_notices", "query": {"and": [{"operation": "EQ", "field_name": "service_name", "field_values": [123]}]}},
             headers=ALICE,
         )
         assert r.status_code == 400
@@ -442,7 +477,8 @@ class TestSafety:
         r = client.post(
             "/query",
             json={
-                "group_by": ["country_name", "country_name"],
+                "table": "t4_notices",
+                "group_by": ["service_name", "service_name"],
                 "aggregates": [{"function": "COUNT", "alias": "n"}],
             },
             headers=ALICE,
@@ -453,8 +489,9 @@ class TestSafety:
         r = client.post(
             "/query",
             json={
-                "group_by": ["country_name"],
-                "aggregates": [{"function": "SUM", "field_name": "num_requests", "alias": "country_name"}],
+                "table": "t4_notices",
+                "group_by": ["service_name"],
+                "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "service_name"}],
             },
             headers=ALICE,
         )
@@ -463,15 +500,15 @@ class TestSafety:
     def test_duplicate_field_is_400(self):
         r = client.post(
             "/query",
-            json={"fields": ["country_name", "country_name"]},
+            json={"table": "t4_notices", "fields": ["service_name", "service_name"]},
             headers=ALICE,
         )
         assert r.status_code == 400
 
-    def test_no_sql_field_accepted(self):
-        # The old free-form `sql` field is gone; sending it yields an empty
-        # (default) query rather than executing arbitrary SQL.
-        r = client.post("/query", json={"sql": "DROP TABLE countries"}, headers=ALICE)
+    def test_extra_sql_field_ignored(self):
+        # The model has no free-form `sql` field; an extra one is ignored, and the
+        # query runs the validated default SELECT for the named table.
+        r = client.post("/query", json={"table": "t4_notices", "sql": "DROP TABLE services"}, headers=ALICE)
         assert r.status_code == 202
         job = _wait_for_job(r.json()["job_id"], ALICE)
         assert job["status"] == "done"  # ran the default SELECT, not the DROP

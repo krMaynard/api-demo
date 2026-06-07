@@ -1,56 +1,53 @@
 """Pytest configuration — runs before any test file is imported.
 
-Sets DB_PATH and API_KEYS_JSON env vars so main.py picks them up at
-module-level import time, which happens after this file is loaded.
+Builds a small VLOP-DSA-shaped SQLite DB (via seed.build_db, the same code path
+the real seed uses) and sets DB_PATH/API_KEYS_JSON env vars so main.py picks
+them up at module-level import time, which happens after this file is loaded.
 """
 import os
-import sqlite3
 import tempfile
+
+import seed
 
 _tmp = tempfile.mkdtemp()
 _DB = os.path.join(_tmp, "test.db")
 
-_conn = sqlite3.connect(_DB)
-_conn.executescript("""
-    CREATE TABLE periods   (id INTEGER PRIMARY KEY, label TEXT NOT NULL UNIQUE);
-    CREATE TABLE countries (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
-    CREATE TABLE requestors(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-    CREATE TABLE products  (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-    CREATE TABLE reasons   (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-    CREATE TABLE removals (
-        id            INTEGER PRIMARY KEY,
-        period_id     INTEGER NOT NULL REFERENCES periods(id),
-        country_id    INTEGER NOT NULL REFERENCES countries(id),
-        requestor_id  INTEGER NOT NULL REFERENCES requestors(id),
-        product_id    INTEGER NOT NULL REFERENCES products(id),
-        reason_id     INTEGER NOT NULL REFERENCES reasons(id),
-        num_requests  INTEGER NOT NULL,
-        items_requested INTEGER NOT NULL,
-        removed_legal   INTEGER NOT NULL,
-        removed_policy  INTEGER NOT NULL,
-        not_found       INTEGER NOT NULL,
-        not_enough_info INTEGER NOT NULL,
-        no_action       INTEGER NOT NULL,
-        already_removed INTEGER NOT NULL
-    );
-""")
-_conn.executemany("INSERT INTO periods   VALUES (?,?)", [(0,"Jan-Jun 2024"),(1,"Jul-Dec 2024")])
-_conn.executemany("INSERT INTO countries VALUES (?,?,?)", [(0,"US","United States"),(1,"DE","Germany")])
-_conn.executemany("INSERT INTO requestors VALUES (?,?)", [(0,"Police"),(1,"Court Order")])
-_conn.executemany("INSERT INTO products  VALUES (?,?)", [(0,"YouTube"),(1,"Web Search")])
-_conn.executemany("INSERT INTO reasons   VALUES (?,?)", [(0,"Defamation"),(1,"Privacy")])
-_conn.executemany(
-    "INSERT INTO removals (period_id,country_id,requestor_id,product_id,reason_id,"
-    "num_requests,items_requested,removed_legal,removed_policy,not_found,"
-    "not_enough_info,no_action,already_removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-    [
-        (0, 0, 0, 0, 0, 10, 100, 50, 10, 5, 5, 10, 20),
-        (0, 1, 0, 1, 1,  5,  50, 20,  5, 5, 5,  5, 10),
-        (1, 0, 1, 0, 0,  3,  30, 15,  5, 2, 2,  3,  3),
-    ],
-)
-_conn.commit()
-_conn.close()
+# A tiny but representative slice of the vlop-dsa.json shape: 2 services across
+# 2 platforms, a couple of categories/sections/indicators/scopes/surfaces, and a
+# few fact rows per report table (chosen so aggregations have known totals).
+_FIXTURE = {
+    "meta": {"period": "2025-07-01/2025-12-31", "generated": "2026-05-13"},
+    "services": ["YouTube", "Facebook"],
+    "service_platforms": ["Google", "Meta"],
+    "categories": ["TOTAL", "STATEMENT_CATEGORY_ILLEGAL_OR_HARMFUL_SPEECH"],
+    "category_labels": {"TOTAL": "All the entries",
+                        "STATEMENT_CATEGORY_ILLEGAL_OR_HARMFUL_SPEECH": "Illegal or harmful speech"},
+    "sections": ["Internal complaints mechanism"],
+    "indicators": ["Number of complaints submitted to the internal-complaints mechanism", "Summary"],
+    "scopes": ["Total number", "Decisions upheld"],
+    "surfaces": ["All", "Ads"],
+    # t3: [svc, cat, scope, orders_to_act, items, orders_to_provide_info]
+    "t3": [[0, 0, 0, 11, 22, 3], [1, 0, 0, 5, 6, 1]],
+    # t4: [svc, cat, notices, tf_notices, items, tf_items, median, tf_median, act_law, tf_act_law, act_tos, tf_act_tos]
+    "t4": [[0, 0, 100, 10, 200, 20, 5, None, 30, 3, 70, 7],
+           [0, 1, 40, 4, 80, 8, 6, None, 10, 1, 30, 3],
+           [1, 0, 50, 5, 90, 9, 4, None, 20, 2, 30, 3]],
+    # t5: 18 cols [svc, cat, measures, automated, 7 vis_*, 3 monetary_*, service x2, account x2]
+    "t5": [[0, 0, 9, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+    # t6: t5 + surface_id
+    "t6": [[0, 0, 9, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+    # t7/t8: [svc, section, indicator, scope, value, surface]
+    "t7": [[0, 0, 0, 0, 1000, 0], [1, 0, 0, 0, 500, 0]],
+    "t8": [[0, 0, 0, 0, 7, 0]],
+    # t9: [svc, section, indicator, scope, value]
+    "t9": [[0, 0, 0, 0, 12]],
+    # t10: [svc, scope, value]
+    "t10": [[0, 0, 64767887], [1, 0, 50000000]],
+    # t11: [svc, indicator, value_text]
+    "t11": [[0, 1, "YouTube qualitative summary text."]],
+}
+
+seed.build_db(_FIXTURE, _DB)
 
 os.environ.setdefault("DB_PATH", _DB)
 os.environ.setdefault("API_KEYS_JSON", '{"alice":{"name":"alice"},"bob":{"name":"bob"}}')

@@ -2,29 +2,32 @@
 
 ## What this is
 
-A FastAPI demo service that accepts **structured query parameters** (not SQL)
-via HTTP, runs the resulting query asynchronously on background worker threads,
-and returns results as JSON or CSV. Backed by a read-only SQLite database
-seeded from the Google Government Content Removals dataset.
+A FastAPI service that accepts **structured query parameters** (not SQL) via
+HTTP, runs the resulting query asynchronously on background worker threads, and
+returns results as JSON or CSV. Backed by a read-only SQLite database seeded from
+the aggregated **EU Digital Services Act (DSA) VLOP transparency reports** —
+content-moderation statistics for 33 designated Very Large Online Platforms /
+Search Engines (H2 2025), tables 3–11 of the DSA Implementing Regulation template.
 
 Built to demonstrate two things:
 
 1. The **async-job / poll pattern**: `POST /query` returns `202 + job_id`
    immediately; the client polls `/jobs/{id}` until `status=done`, then
    fetches `/jobs/{id}/result`.
-2. A **safe, no-SQL query interface** modelled on the TikTok Research API:
-   boolean `and`/`or`/`not` clauses of `{operation, field_name, field_values}`,
-   plus `group_by`, `aggregates`, `sort`, and `max_count`. The server
-   validates everything against a fixed field registry and compiles it into a
-   single parameterised SELECT (`compile_query` in `main.py`). Arbitrary SQL is
-   never accepted or executed.
+2. A **safe, no-SQL query interface** modelled on the TikTok Research API: a
+   query names a `table` (one of the 9 DSA report tables), then a boolean
+   `and`/`or`/`not` clause of `{operation, field_name, field_values}`, plus
+   `group_by`, `aggregates`, `sort`, and `max_count`. The server validates
+   everything against that table's fixed field registry (`TABLES`/`TableSpec`)
+   and compiles it into a single parameterised SELECT (`compile_query` in
+   `main.py`). Arbitrary SQL is never accepted or executed.
 
 ## Repo layout
 
 | File | Purpose |
 |------|---------|
 | `main.py` | FastAPI app — all endpoints, job runner, in-memory job registry |
-| `seed.py` | Build `demo.db` from the source JSON in `../krMaynard.github.io/data/` |
+| `seed.py` | Build `demo.db` from `../krMaynard.github.io/data/vlop-dsa.json` (`build_db()` is reused by `conftest.py`) |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
 | `static/portal.html` | Researcher portal single-page app (served at `/portal`) |
 | `scripts/_demo_server.py` | Shared helper: seed DB + run a temp server (used by the GIF generators) |
@@ -57,7 +60,7 @@ Repos are expected as siblings:
 ```
 parent/
   api-demo/            ← this repo
-  krMaynard.github.io/ ← source data lives at data/google-government-removals.json
+  krMaynard.github.io/ ← source data lives at data/vlop-dsa.json
 ```
 
 ## Running the demo
@@ -77,33 +80,41 @@ In production these would come from a secret store.
 
 ## Database schema
 
-Star schema seeded from `google-government-removals.json`:
+Seeded from `vlop-dsa.json` (compact interned format → star schema). Shared
+dimension tables `services` (with `platform` = parent company), `categories`
+(code + label), `sections`, `indicators`, `scopes`, `surfaces`, plus a `meta`
+key/value table (`period`, `generated`). One **fact table per DSA report table**:
 
-- **`removals`** — fact table (period × country × requestor × product × reason + counts)
-- **`periods`** — "January - June 2024" labels
-- **`countries`** — ISO code + display name
-- **`requestors`** — Court Order, Police, Government Officials, …
-- **`products`** — YouTube, Web Search, Maps, …
-- **`reasons`** — Defamation, National Security, Privacy, …
+- **`t3_member_state_orders`** — Art. 9 & 10 orders, by category × scope
+- **`t4_notices`** — Art. 16 notices, by category (+ Trusted-Flagger `tf_*`)
+- **`t5_own_initiative_illegal`** / **`t6_own_initiative_tos`** — own-initiative actions, by category × 16 restriction types (t6 + surface)
+- **`t7_appeals_recidivism`** / **`t8_automated_means`** — section × indicator × scope × surface → value
+- **`t9_human_resources`** — section × indicator × scope → value
+- **`t10_amar`** — Average Monthly Active Recipients, by scope
+- **`t11_qualitative`** — free-text descriptions, by indicator (`value_text`)
 
-The DB is opened `mode=ro` as defence in depth.
+Fact-row leading values are indices into the lookup arrays (= the dimension row
+id), so seeding is positional. The DB is opened `mode=ro` as defence in depth.
 
 ## Query model
 
-Requests are structured (see `QueryRequest`/`compile_query` in `main.py`):
+Requests are structured (see `QueryRequest`/`compile_query`/`TableSpec` in
+`main.py`). A query **must name a `table`**; that table's `TableSpec` fixes the
+FROM/joins and the registry of:
 
-- **Dimensions** (text, `EQ`/`IN`): `period_label`, `country_code`,
-  `country_name`, `requestor_name`, `product_name`, `reason_name`.
-- **Measures** (numeric, `EQ`/`IN`/`GT`/`GTE`/`LT`/`LTE`): `num_requests`,
-  `items_requested`, `removed_legal`, `removed_policy`, `not_found`,
-  `not_enough_info`, `no_action`, `already_removed`.
+- **Dimensions** (text, `EQ`/`IN`): always `service_name`, `platform`; plus
+  per-table `category_code`/`category_label`, `section`, `indicator`, `scope`,
+  `surface`, or `qualitative_text` (t11).
+- **Measures** (numeric, `EQ`/`IN`/`GT`/`GTE`/`LT`/`LTE`): per-table count
+  columns (e.g. t4 `notices`/`tf_notices`/…, t7–t10 `value`). t11 has none.
 - **Aggregates**: `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a measure, with an alias.
-- `group_by`, `sort`, `max_count`, optional `callback_url` (webhook). `GET /fields`
-  documents the query fields.
+- `group_by`, `sort`, `max_count`, optional `callback_url` (webhook). `GET /tables`
+  lists the tables; `GET /fields?table=…` and `GET /schema/{table}` document a
+  table's fields.
 
-`compile_query` is the single trust boundary — keep all field/operation
-validation there, and never build SQL by interpolating user values (always
-bind with `?`).
+`compile_query` is the single trust boundary — it resolves `req.table` to a
+`TableSpec` and validates every field/operation against that table's registry.
+Never build SQL by interpolating user values (always bind with `?`).
 
 ## Key design decisions
 
@@ -183,9 +194,9 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
 | POST | `/portal/register` | — | Issue a demo API key (`{name, email}`) — rate-limited, expiring |
 | DELETE | `/portal/key` | key | Revoke your own portal-issued key |
-| GET | `/fields` | key | Queryable fields + operations |
-| GET | `/tables` | key | List tables |
-| GET | `/schema/{table}` | key | Column info |
+| GET | `/tables` | key | List the DSA report tables + dataset period |
+| GET | `/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |
+| GET | `/schema/{table}` | key | Field registry for a report table |
 | POST | `/query` | key | Submit structured query (optional `callback_url`) → 202 + job_id |
 | GET | `/jobs` | key | List your jobs |
 | GET | `/jobs/{id}` | key | Job status |

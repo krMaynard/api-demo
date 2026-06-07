@@ -11,7 +11,7 @@
 
 ### 1.1 Purpose
 
-`api-demo` is a FastAPI service that exposes a read-only SQLite database (seeded from the Google Government Content Removals dataset) as a queryable HTTP API. Queries are described with **structured parameters** (a TikTok-Research-API-style boolean query, not SQL) and compiled server-side into a single parameterised SELECT. It is designed to demonstrate the **async-job / poll pattern** for long-running queries without tying up HTTP connections, behind a query interface that never executes caller-authored SQL.
+`api-demo` is a FastAPI service that exposes a read-only SQLite database (seeded from the aggregated EU DSA VLOP transparency reports, tables 3–11) as a queryable HTTP API. Queries are described with **structured parameters** (a TikTok-Research-API-style boolean query, not SQL) and compiled server-side into a single parameterised SELECT. It is designed to demonstrate the **async-job / poll pattern** for long-running queries without tying up HTTP connections, behind a query interface that never executes caller-authored SQL.
 
 ### 1.2 Problem Statement
 
@@ -87,8 +87,8 @@ A developer giving a live presentation who runs `demo.py --pause` to step throug
 
 | ID | Requirement |
 |----|-------------|
-| F-11 | `POST /query` accepts a structured JSON body (a boolean `query` of `and`/`or`/`not` conditions, plus optional `fields`, `group_by`, `aggregates`, `sort`, `max_count`) — **never raw SQL**. On a valid query it returns `202 Accepted` immediately with a job object and a `Location` header pointing to the job status URL. |
-| F-11a | The request is validated against a fixed field registry and compiled into a single parameterised SELECT (`compile_query`). All values are bound as parameters. Invalid queries (unknown field, illegal operation for a field type, bad aggregate alias, sort over a non-output column) are rejected synchronously with `400 Bad Request` and never become jobs. `GET /fields` documents the queryable dimensions, measures, and operations. |
+| F-11 | `POST /query` accepts a structured JSON body that names a `table` (one of the 9 DSA report tables) plus a boolean `query` of `and`/`or`/`not` conditions and optional `fields`, `group_by`, `aggregates`, `sort`, `max_count` — **never raw SQL**. On a valid query it returns `202 Accepted` immediately with a job object and a `Location` header pointing to the job status URL. A missing/unknown `table` is rejected with `400`. |
+| F-11a | The request is validated against the named table's fixed field registry (`TableSpec`) and compiled into a single parameterised SELECT (`compile_query`). All values are bound as parameters. Invalid queries (unknown table, field not in that table, illegal operation for a field type, bad aggregate alias, sort over a non-output column) are rejected synchronously with `400 Bad Request` and never become jobs. `GET /tables` lists the tables; `GET /fields?table=…` / `GET /schema/{table}` document each table's dimensions, measures, and operations. |
 | F-12 | The compiled query is queued and executed on a background thread pool. The caller does not block waiting for execution. |
 | F-13 | If the query result exceeds `ROW_LIMIT` rows (default 100,000), the job fails with a descriptive error asking the caller to lower `max_count`. |
 | F-14 | Caller-authored SQL cannot be submitted at all, so there is no write/DDL path. As defence in depth the database is still opened read-only, so even a compiler bug could not mutate it. |
@@ -187,38 +187,35 @@ queued → running → done
 
 ### 5.1 SQLite Schema (Star Schema)
 
-The database is seeded from the [Google Government Content Removals](https://transparencyreport.google.com/government-removals/overview) dataset.
+The database is seeded from the aggregated [EU DSA VLOP transparency reports](https://transparency.dsa.ec.europa.eu/) (`vlop-dsa.json`) — content-moderation statistics for 33 designated VLOP/VLOSE services for H2 2025, following tables 3–11 of the DSA Implementing Regulation template.
 
-**Dimension tables** (each has `id INTEGER PRIMARY KEY` as surrogate key, plus table-specific descriptive columns):
+**Shared dimension tables** (`id INTEGER PRIMARY KEY` = the row's position in the source lookup array):
 
 | Table | Columns | Description |
 |-------|---------|-------------|
-| `periods` | `id`, `label` | Reporting period labels, e.g. "January – June 2024" |
-| `countries` | `id`, `code`, `name` | ISO country code + display name |
-| `requestors` | `id`, `name` | Type of requesting entity (Court Order, Police, etc.) |
-| `products` | `id`, `name` | Google product (YouTube, Web Search, Maps, etc.) |
-| `reasons` | `id`, `name` | Removal reason (Defamation, National Security, Privacy, etc.) |
+| `services` | `id`, `name`, `platform` | Reporting service + parent company (e.g. YouTube / Google) |
+| `categories` | `id`, `code`, `label` | DSA content category code + human label |
+| `sections` | `id`, `name` | Report section (t7–t9) |
+| `indicators` | `id`, `name` | Reported indicator (t7–t9, t11) |
+| `scopes` | `id`, `name` | Scope/breakdown of a value |
+| `surfaces` | `id`, `name` | Surface/sub-report (t6–t8; e.g. Core, Ads) |
+| `meta` | `key`, `value` | Dataset metadata (`period`, `generated`) |
 
-**Fact table — `removals`**:
+**Fact tables** — one per DSA report table, each with a `service_id` FK plus the dimensions and measures for that table. A query selects one via the `table` parameter:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Surrogate key |
-| `period_id` | INTEGER FK | → periods |
-| `country_id` | INTEGER FK | → countries |
-| `requestor_id` | INTEGER FK | → requestors |
-| `product_id` | INTEGER FK | → products |
-| `reason_id` | INTEGER FK | → reasons |
-| `num_requests` | INTEGER | Number of legal requests |
-| `items_requested` | INTEGER | Items flagged for removal |
-| `removed_legal` | INTEGER | Removed for legal reasons |
-| `removed_policy` | INTEGER | Removed for policy violations |
-| `not_found` | INTEGER | Items not found |
-| `not_enough_info` | INTEGER | Requests with insufficient info |
-| `no_action` | INTEGER | Items with no action taken |
-| `already_removed` | INTEGER | Items already removed |
+| Table | Dimensions (FKs) | Measures |
+|-------|------------------|----------|
+| `t3_member_state_orders` | category, scope | `orders_to_act`, `items`, `orders_to_provide_info` |
+| `t4_notices` | category | `notices`, `tf_notices`, `items`, `tf_items`, `median_time`, `actions_law`, `actions_tos`, … |
+| `t5_own_initiative_illegal` | category | `measures`, `automated`, `vis_*` (7), `monetary_*` (3), `service_*` (2), `account_*` (2) |
+| `t6_own_initiative_tos` | category, surface | same 16 measures as t5 |
+| `t7_appeals_recidivism` | section, indicator, scope, surface | `value` |
+| `t8_automated_means` | section, indicator, scope, surface | `value` |
+| `t9_human_resources` | section, indicator, scope | `value` |
+| `t10_amar` | scope | `value` |
+| `t11_qualitative` | indicator | `qualitative_text` (free text; no numeric measure) |
 
-Indexes exist on all foreign key columns in `removals` to accelerate joins.
+Each fact table is indexed on `service_id`. Fact rows are inserted positionally — the leading lookup indices in each source row land directly in the `*_id` columns.
 
 ### 5.2 Job Object
 
@@ -253,8 +250,9 @@ X-API-Key: alice
 Content-Type: application/json
 
 {
-  "group_by": ["country_name"],
-  "aggregates": [{"function": "SUM", "field_name": "items_requested", "alias": "total"}],
+  "table": "t4_notices",
+  "group_by": ["service_name"],
+  "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "total"}],
   "sort": [{"field_name": "total", "order": "desc"}],
   "max_count": 5
 }
@@ -296,8 +294,8 @@ X-API-Key: alice
 
 ```json
 {
-  "columns": ["country_id", "total"],
-  "rows": [[42, 182345], [7, 90123], ...],
+  "columns": ["service_name", "total"],
+  "rows": [["Google Maps", 975841], ["Facebook", 788745], ...],
   "row_count": 5
 }
 ```

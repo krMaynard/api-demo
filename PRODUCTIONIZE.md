@@ -30,7 +30,7 @@ The following items are **complete** — no further code changes required:
 python seed.py
 
 # Or point at the JSON directly
-python seed.py --source /path/to/google-government-removals.json --db demo.db
+python seed.py --source /path/to/vlop-dsa.json --db demo.db
 ```
 
 ### 2. Configure environment
