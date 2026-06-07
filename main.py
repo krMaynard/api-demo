@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
@@ -105,6 +105,11 @@ ALLOW_DEMO_KEYS = os.getenv("ALLOW_DEMO_KEYS", "1").lower() in ("1", "true", "ye
 # on each Cloud Run revision; defaults to "dev" locally. Surfaced at GET /version
 # and in the X-Version response header so you can confirm what's actually live.
 APP_VERSION = os.getenv("APP_VERSION") or "dev"
+# Combined-site layout: the dashboard is served at "/", and the JSON API lives
+# under this prefix on the same origin (no CORS). Operational endpoints
+# (/healthz, /readyz, /metrics, /version) and pages (/portal) stay at the root.
+API_PREFIX = "/api"
+api_router = APIRouter()
 # Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
 # overwrites it. Off by default: trusting it unconditionally would let any client
 # spoof the header to dodge the registration rate limit.
@@ -260,7 +265,7 @@ def _download_signature(job_id: str, fmt: str, expires: int) -> str:
 def _make_download_url(job_id: str, fmt: str) -> str:
     expires = int(time.time()) + DOWNLOAD_URL_TTL
     sig = _download_signature(job_id, fmt, expires)
-    return f"/jobs/{job_id}/download?format={fmt}&expires={expires}&sig={sig}"
+    return f"{API_PREFIX}/jobs/{job_id}/download?format={fmt}&expires={expires}&sig={sig}"
 
 
 def _verify_download_signature(job_id: str, fmt: str, expires: int, sig: str) -> bool:
@@ -343,8 +348,8 @@ class Job:
             "error": self.error,
             "row_count": rc,
             "compiled_sql": self.sql,
-            "status_url": f"/jobs/{self.id}",
-            "result_url": f"/jobs/{self.id}/result" if self.status == "done" else None,
+            "status_url": f"{API_PREFIX}/jobs/{self.id}",
+            "result_url": f"{API_PREFIX}/jobs/{self.id}/result" if self.status == "done" else None,
             # Signed, expiring links that download the result without an API key.
             "download_urls": (
                 {fmt: _make_download_url(self.id, fmt) for fmt in DOWNLOAD_FORMATS}
@@ -1274,7 +1279,7 @@ def _job_for_owner(job_id: str, owner_key: str) -> Job:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@api_router.get("")
 def root() -> dict[str, Any]:
     meta = _dataset_meta()
     return {
@@ -1282,25 +1287,27 @@ def root() -> dict[str, Any]:
         "dataset": "EU Digital Services Act VLOP/VLOSE transparency reports (tables 3–11)",
         "period": meta.get("period"),
         "pattern": "async-job",
-        "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted); pick a `table` (GET /tables)",
-        "auth": "X-API-Key header required for all endpoints except `/`, `/docs`, `/openapi.json`",
+        "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted); pick a `table` (GET /api/tables)",
+        "auth": "X-API-Key header required for the query API; public: `/`, `/api`, `/api/overview`, `/docs`, `/openapi.json`",
         "endpoints": {
+            "GET /": "Public VLOP transparency dashboard (web UI)",
+            "GET /api/overview": "Public headline aggregates powering the dashboard (no auth)",
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
-            "POST /auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key, or pending approval",
-            "POST /portal/register": "Demo: issue an API key without auth (disabled when ALLOW_DEMO_KEYS=0)",
-            "DELETE /portal/key": "Revoke your session / portal-issued key",
-            "GET /admin/registrations": "Admin: list researcher registrations",
-            "POST /admin/registrations/{email}/approve": "Admin: approve an account",
-            "POST /admin/registrations/{email}/revoke": "Admin: revoke an account",
-            "POST /query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
-            "GET /jobs": "List your jobs",
-            "GET /jobs/{job_id}": "Job status (your jobs only)",
-            "GET /jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
-            "GET /jobs/{job_id}/download?...": "Secure result download via a signed, expiring URL (no key)",
-            "DELETE /jobs/{job_id}": "Cancel a queued/running job, or remove a finished one",
-            "GET /tables": "List the queryable DSA report tables",
-            "GET /fields?table=…": "Fields and operations for a table",
-            "GET /schema/{table}": "Field registry for a report table",
+            "POST /api/auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key, or pending approval",
+            "POST /api/portal/register": "Demo: issue an API key without auth (disabled when ALLOW_DEMO_KEYS=0)",
+            "DELETE /api/portal/key": "Revoke your session / portal-issued key",
+            "GET /api/admin/registrations": "Admin: list researcher registrations",
+            "POST /api/admin/registrations/{email}/approve": "Admin: approve an account",
+            "POST /api/admin/registrations/{email}/revoke": "Admin: revoke an account",
+            "POST /api/query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
+            "GET /api/jobs": "List your jobs",
+            "GET /api/jobs/{job_id}": "Job status (your jobs only)",
+            "GET /api/jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
+            "GET /api/jobs/{job_id}/download?...": "Secure result download via a signed, expiring URL (no key)",
+            "DELETE /api/jobs/{job_id}": "Cancel a queued/running job, or remove a finished one",
+            "GET /api/tables": "List the queryable DSA report tables",
+            "GET /api/fields?table=…": "Fields and operations for a table",
+            "GET /api/schema/{table}": "Field registry for a report table",
             "GET /healthz": "Liveness probe",
             "GET /readyz": "Readiness probe (checks DB connection)",
             "GET /version": "Deployed build identifier (commit SHA)",
@@ -1379,6 +1386,15 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+@app.get("/", response_class=HTMLResponse)
+def dashboard_page() -> FileResponse:
+    """Serve the public VLOP transparency dashboard (reads GET /api/overview)."""
+    path = os.path.join(STATIC_DIR, "index.html")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Dashboard page not found.")
+    return FileResponse(path, media_type="text/html")
+
+
 @app.get("/portal", response_class=HTMLResponse)
 def portal_page() -> FileResponse:
     """Serve the researcher portal single-page app."""
@@ -1388,7 +1404,63 @@ def portal_page() -> FileResponse:
     return FileResponse(path, media_type="text/html")
 
 
-@app.post("/portal/register", status_code=201)
+# The dashboard aggregates never change at runtime (the DB is opened mode=ro and
+# baked into the image), so compute them once and memoise — this public endpoint
+# then serves from memory instead of re-querying on every hit.
+_overview_cache: dict[str, Any] | None = None
+_overview_cache_lock = threading.Lock()
+
+
+def _compute_overview() -> dict[str, Any]:
+    conn = _connect_ro()
+    try:
+        meta = _dataset_meta()
+        services = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
+        platforms = conn.execute("SELECT COUNT(DISTINCT platform) FROM services").fetchone()[0]
+        total_notices = conn.execute("SELECT COALESCE(SUM(notices), 0) FROM t4_notices").fetchone()[0]
+        top_platforms = [
+            {"platform": p, "notices": n}
+            for p, n in conn.execute(
+                "SELECT s.platform, COALESCE(SUM(t.notices), 0) AS n "
+                "FROM t4_notices t JOIN services s ON s.id = t.service_id "
+                "GROUP BY s.platform ORDER BY n DESC LIMIT 10"
+            ).fetchall()
+        ]
+        by_category = [
+            {"category": c, "notices": n}
+            for c, n in conn.execute(
+                "SELECT cat.label, COALESCE(SUM(t.notices), 0) AS n "
+                "FROM t4_notices t JOIN categories cat ON cat.id = t.category_id "
+                "GROUP BY cat.label ORDER BY n DESC LIMIT 8"
+            ).fetchall()
+        ]
+        return {
+            "period": meta.get("period"),
+            "generated": meta.get("generated"),
+            "services": services,
+            "platforms": platforms,
+            "total_notices": total_notices,
+            "top_platforms": top_platforms,
+            "by_category": by_category,
+        }
+    finally:
+        conn.close()
+
+
+@api_router.get("/overview")
+def overview() -> dict[str, Any]:
+    """Public headline aggregates for the dashboard — no auth. Memoised: the
+    read-only DB is static, so we compute the fixed queries once (no user input
+    reaches SQL) and serve from memory thereafter."""
+    global _overview_cache
+    if _overview_cache is None:
+        with _overview_cache_lock:
+            if _overview_cache is None:
+                _overview_cache = _compute_overview()
+    return _overview_cache
+
+
+@api_router.post("/portal/register", status_code=201)
 def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
     """Issue a demo API key for a researcher (no real authentication)."""
     if not ALLOW_DEMO_KEYS:
@@ -1429,7 +1501,7 @@ def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
     }
 
 
-@app.delete("/portal/key")
+@api_router.delete("/portal/key")
 def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
     """Revoke the calling key/session (configured demo keys can't be revoked)."""
     key = principal["key"]
@@ -1447,7 +1519,7 @@ def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
 # implicitly approved. Approved accounts get a first-party session key.
 
 
-@app.post("/auth/google")
+@api_router.post("/auth/google")
 def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -> dict[str, Any]:
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google sign-in is not configured on this server.")
@@ -1492,7 +1564,7 @@ def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -
             "email": email, "expires_at": expires_at, "header": "X-API-Key"}
 
 
-@app.get("/admin/registrations")
+@api_router.get("/admin/registrations")
 def list_registrations(status: str | None = None, _: dict = Depends(require_admin)) -> dict[str, Any]:
     """List researcher registrations, optionally filtered by status."""
     regs = _registrations.list()
@@ -1502,7 +1574,7 @@ def list_registrations(status: str | None = None, _: dict = Depends(require_admi
     return {"registrations": regs, "count": len(regs)}
 
 
-@app.post("/admin/registrations/{email}/approve")
+@api_router.post("/admin/registrations/{email}/approve")
 def approve_registration(email: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
     """Approve an account (pre-approval is allowed before the user has signed in)."""
     email = email.strip().lower()
@@ -1518,7 +1590,7 @@ def approve_registration(email: str, admin: dict = Depends(require_admin)) -> di
     return {"email": email, "status": "approved"}
 
 
-@app.post("/admin/registrations/{email}/revoke")
+@api_router.post("/admin/registrations/{email}/revoke")
 def revoke_registration(email: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
     """Revoke an account's access (its live sessions stop working immediately)."""
     email = email.strip().lower()
@@ -1611,7 +1683,7 @@ def _table_fields_doc(table: str, spec: TableSpec) -> dict[str, Any]:
     }
 
 
-@app.get("/fields")
+@api_router.get("/fields")
 def list_fields(table: str | None = None, _: dict = Depends(require_api_key)) -> dict[str, Any]:
     """Fields for a report table (`?table=…`), or an overview of all tables."""
     if table is None:
@@ -1626,7 +1698,7 @@ def list_fields(table: str | None = None, _: dict = Depends(require_api_key)) ->
     return _table_fields_doc(table, spec)
 
 
-@app.get("/tables")
+@api_router.get("/tables")
 def list_tables(_: dict = Depends(require_api_key)) -> dict[str, Any]:
     """The queryable DSA report tables and the dataset's reporting period."""
     meta = _dataset_meta()
@@ -1638,7 +1710,7 @@ def list_tables(_: dict = Depends(require_api_key)) -> dict[str, Any]:
     }
 
 
-@app.get("/schema/{table}")
+@api_router.get("/schema/{table}")
 def table_schema(table: str, _: dict = Depends(require_api_key)) -> dict[str, Any]:
     """The queryable field registry (dimensions + measures) for a report table."""
     spec = TABLES.get(table)
@@ -1647,7 +1719,7 @@ def table_schema(table: str, _: dict = Depends(require_api_key)) -> dict[str, An
     return _table_fields_doc(table, spec)
 
 
-@app.post("/query", status_code=202)
+@api_router.post("/query", status_code=202)
 def submit_query(
     body: QueryRequest,
     response: Response,
@@ -1684,16 +1756,16 @@ def submit_query(
     JOB_QUEUE_DEPTH.inc()  # queued; decremented when _execute_job picks it up
     _executor.submit(_execute_job, job.id)
     logger.info("job_submitted", extra={"data": {"job_id": job.id, "user": principal["name"]}})
-    response.headers["Location"] = f"/jobs/{job.id}"
+    response.headers["Location"] = f"{API_PREFIX}/jobs/{job.id}"
     return job.to_public()
 
 
-@app.get("/jobs")
+@api_router.get("/jobs")
 def list_jobs(limit: int = 50, principal: dict = Depends(require_api_key)) -> dict[str, Any]:
     return {"jobs": [j.to_public() for j in _store.list_for_owner(principal["key"], limit)]}
 
 
-@app.get("/jobs/{job_id}")
+@api_router.get("/jobs/{job_id}")
 def get_job(job_id: str, principal: dict = Depends(require_api_key)) -> dict[str, Any]:
     return _job_for_owner(job_id, principal["key"]).to_public()
 
@@ -1726,7 +1798,7 @@ def _render_result(
     )
 
 
-@app.get("/jobs/{job_id}/result", response_model=None)
+@api_router.get("/jobs/{job_id}/result", response_model=None)
 def get_job_result(
     job_id: str,
     format: Literal["json", "csv"] = "json",
@@ -1741,7 +1813,7 @@ def get_job_result(
     return _render_result(job_id, format, as_attachment=False)
 
 
-@app.get("/jobs/{job_id}/download", response_model=None)
+@api_router.get("/jobs/{job_id}/download", response_model=None)
 def download_job_result(
     job_id: str,
     expires: int,
@@ -1772,7 +1844,7 @@ def download_job_result(
     return _render_result(job_id, format, as_attachment=True)
 
 
-@app.delete("/jobs/{job_id}")
+@api_router.delete("/jobs/{job_id}")
 def cancel_job(job_id: str, principal: dict = Depends(require_api_key)) -> dict[str, Any]:
     job = _job_for_owner(job_id, principal["key"])
     prior = job.status
@@ -1789,3 +1861,8 @@ def cancel_job(job_id: str, principal: dict = Depends(require_api_key)) -> dict[
 
     _store.remove(job_id)
     return {"job_id": job_id, "previous_status": prior, "deleted": True}
+
+
+# Mount the JSON API under /api (the dashboard owns "/"). Done last so every
+# @api_router route above is registered before inclusion.
+app.include_router(api_router, prefix=API_PREFIX)

@@ -30,6 +30,7 @@ Built to demonstrate two things:
 | `seed.py` | Build `demo.db` from a `vlop-dsa.json` (`--source`/`SEED_SOURCE_JSON`; default = sibling repo) — `build_db()` is reused by `conftest.py` |
 | `data/vlop-dsa.json` | Vendored dataset snapshot — what the Docker image is seeded from (refresh via `scripts/refresh-dataset.sh`) |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
+| `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js, reads `GET /api/overview` |
 | `static/portal.html` | Researcher portal single-page app (served at `/portal`) — Google sign-in + demo fallback |
 | `Dockerfile` | Self-contained image: installs deps, seeds `demo.db` at build time, runs uvicorn on `$PORT` as non-root |
 | `service.yaml` | Cloud Run (Knative) manifest — prod env + startup/liveness probes |
@@ -214,24 +215,34 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 
 ## Endpoints
 
+Combined-site layout: the **dashboard is served at `/`** and the JSON API lives
+under **`/api/*`** on the same origin (no CORS). Operational endpoints
+(`/healthz`, `/readyz`, `/metrics`, `/version`) and the `/portal` page stay at the
+root. The API endpoints are registered on an `APIRouter` included with
+`prefix=API_PREFIX` (`/api`); link builders (`status_url`/`result_url`/signed
+`download_urls`/`Location`) are prefixed via `API_PREFIX`.
+
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
-| GET | `/` | — | Service info |
+| GET | `/` | — | Public VLOP transparency dashboard (web UI) |
+| GET | `/api/overview` | — | Public headline aggregates powering the dashboard |
+| GET | `/api` | — | API service info |
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
-| POST | `/auth/google` | — | Verify a Google ID token → session key, or `202` pending approval |
-| POST | `/portal/register` | — | Demo: issue a key without auth (`ALLOW_DEMO_KEYS`) |
-| DELETE | `/portal/key` | key | Revoke your own session / portal-issued key |
-| GET | `/admin/registrations` | admin | List researcher registrations (`?status=`) |
-| POST | `/admin/registrations/{email}/approve` | admin | Approve an account |
-| POST | `/admin/registrations/{email}/revoke` | admin | Revoke an account |
-| GET | `/tables` | key | List the DSA report tables + dataset period |
-| GET | `/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |
-| GET | `/schema/{table}` | key | Field registry for a report table |
-| POST | `/query` | key | Submit structured query (optional `callback_url`) → 202 + job_id |
-| GET | `/jobs` | key | List your jobs |
-| GET | `/jobs/{id}` | key | Job status |
-| GET | `/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |
-| GET | `/jobs/{id}/download?format=…&expires=…&sig=…` | signed URL | Secure download, no key needed |
-| DELETE | `/jobs/{id}` | key | Cancel or remove |
+| POST | `/api/auth/google` | — | Verify a Google ID token → session key, or `202` pending approval |
+| POST | `/api/portal/register` | — | Demo: issue a key without auth (`ALLOW_DEMO_KEYS`) |
+| DELETE | `/api/portal/key` | key | Revoke your own session / portal-issued key |
+| GET | `/api/admin/registrations` | admin | List researcher registrations (`?status=`) |
+| POST | `/api/admin/registrations/{email}/approve` | admin | Approve an account |
+| POST | `/api/admin/registrations/{email}/revoke` | admin | Revoke an account |
+| GET | `/api/tables` | key | List the DSA report tables + dataset period |
+| GET | `/api/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |
+| GET | `/api/schema/{table}` | key | Field registry for a report table |
+| POST | `/api/query` | key | Submit structured query (optional `callback_url`) → 202 + job_id |
+| GET | `/api/jobs` | key | List your jobs |
+| GET | `/api/jobs/{id}` | key | Job status |
+| GET | `/api/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |
+| GET | `/api/jobs/{id}/download?format=…&expires=…&sig=…` | signed URL | Secure download, no key needed |
+| DELETE | `/api/jobs/{id}` | key | Cancel or remove |
+| GET | `/healthz` `/readyz` | — | Liveness / readiness probes (root) |
 | GET | `/metrics` | — | Prometheus metrics |
 | GET | `/version` | — | Deployed build (commit SHA via `APP_VERSION`); also the `X-Version` header |

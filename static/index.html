@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EU DSA VLOP Transparency Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #30363d;
+    --fg: #e6edf3; --muted: #9aa7b4; --accent: #58a6ff; --accent2: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "DejaVu Sans Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: radial-gradient(1200px 600px at 50% -10%, #16203a 0%, var(--bg) 55%);
+    color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; padding: 32px 16px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 8px; }
+  header .badge {
+    display: inline-block; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--accent); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 12px; background: var(--panel); margin-bottom: 14px;
+  }
+  header h1 { margin: 0 0 6px; font-size: 28px; }
+  header p { margin: 0; color: var(--muted); }
+  nav { text-align: center; margin: 16px 0 26px; }
+  nav a {
+    color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 600;
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; margin: 0 5px;
+    background: var(--panel); display: inline-block;
+  }
+  nav a:hover { filter: brightness(1.15); }
+  .stats { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
+  .stat {
+    flex: 1 1 160px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px 20px;
+  }
+  .stat .num { font-size: 26px; font-weight: 700; color: var(--accent2); font-family: var(--mono); }
+  .stat .lbl { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 22px 24px; margin: 0 0 20px; box-shadow: 0 8px 30px rgba(0,0,0,.25);
+  }
+  .card h2 { margin: 0 0 4px; font-size: 17px; }
+  .card .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .error { color: #ff7b72; font-size: 14px; }
+  footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 8px; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer code { font-family: var(--mono); color: var(--fg); background: var(--panel2); padding: 1px 6px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="badge">EU DSA · VLOP transparency</span>
+    <h1>VLOP Transparency Dashboard</h1>
+    <p id="period">Content-moderation statistics from the EU Digital Services Act transparency reports.</p>
+  </header>
+
+  <nav>
+    <a href="/portal">Get API access →</a>
+    <a href="/docs">API docs</a>
+    <a href="/api">API info (JSON)</a>
+  </nav>
+
+  <div class="stats" id="stats"></div>
+
+  <section class="card">
+    <h2>Article 16 notices by platform</h2>
+    <p class="sub">Top platforms by total notices received (DSA Table 4).</p>
+    <canvas id="chart-platforms" height="150"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>Article 16 notices by category</h2>
+    <p class="sub">Notices grouped by the category of allegedly illegal content.</p>
+    <canvas id="chart-categories" height="150"></canvas>
+  </section>
+
+  <div class="error" id="error"></div>
+
+  <footer>
+    Public overview from the same-origin API at <code>/api/overview</code>.
+    Researchers can run custom queries via the <a href="/portal">portal</a> + <a href="/docs">API</a>.
+  </footer>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => (n ?? 0).toLocaleString();
+
+function stat(num, lbl) {
+  return `<div class="stat"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
+}
+
+function barChart(canvasId, labels, data, label) {
+  new Chart($(canvasId), {
+    type: "bar",
+    data: { labels, datasets: [{ label, data, backgroundColor: "#58a6ff", borderRadius: 4 }] },
+    options: {
+      indexAxis: "y",
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#9aa7b4" }, grid: { color: "#30363d" } },
+        y: { ticks: { color: "#e6edf3" }, grid: { display: false } },
+      },
+    },
+  });
+}
+
+async function load() {
+  let d;
+  try {
+    const res = await fetch("/api/overview");
+    if (!res.ok) throw new Error(`/api/overview → ${res.status}`);
+    d = await res.json();
+  } catch (err) {
+    $("#error").textContent = "Could not load overview: " + err.message;
+    return;
+  }
+
+  if (d.period) $("#period").textContent = `Reporting period ${d.period} · ${d.services} services across ${d.platforms} platforms.`;
+  $("#stats").innerHTML =
+    stat(fmt(d.services), "Designated services") +
+    stat(fmt(d.platforms), "Parent platforms") +
+    stat(fmt(d.total_notices), "Art. 16 notices");
+
+  // Chart.js is loaded with `defer`, so it's guaranteed ready by DOMContentLoaded.
+  const tp = d.top_platforms || [];
+  barChart("#chart-platforms", tp.map(x => x.platform), tp.map(x => x.notices), "Notices");
+  const bc = d.by_category || [];
+  barChart("#chart-categories", bc.map(x => x.category), bc.map(x => x.notices), "Notices");
+}
+document.addEventListener("DOMContentLoaded", load);
+</script>
+</body>
+</html>

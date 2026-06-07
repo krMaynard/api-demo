@@ -23,7 +23,7 @@ COUNT_ALL = {"table": "t4_notices", "aggregates": [{"function": "COUNT", "alias"
 def _wait_for_job(job_id: str, headers: dict, timeout: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        r = client.get(f"/jobs/{job_id}", headers=headers)
+        r = client.get(f"/api/jobs/{job_id}", headers=headers)
         assert r.status_code == 200
         body = r.json()
         if body["status"] in ("done", "failed", "cancelled"):
@@ -33,7 +33,7 @@ def _wait_for_job(job_id: str, headers: dict, timeout: float = 5.0) -> dict:
 
 
 def _submit_and_wait(query: dict, headers: dict = ALICE) -> dict:
-    r = client.post("/query", json=query, headers=headers)
+    r = client.post("/api/query", json=query, headers=headers)
     assert r.status_code == 202
     return _wait_for_job(r.json()["job_id"], headers)
 
@@ -41,10 +41,15 @@ def _submit_and_wait(query: dict, headers: dict = ALICE) -> dict:
 # ── Infrastructure ────────────────────────────────────────────────────────────
 
 class TestInfra:
-    def test_root_no_auth(self):
-        r = client.get("/")
+    def test_api_index_no_auth(self):
+        r = client.get("/api")
         assert r.status_code == 200
         assert "endpoints" in r.json()
+
+    def test_dashboard_page_served(self):
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
 
     def test_healthz(self):
         assert client.get("/healthz").status_code == 200
@@ -63,7 +68,7 @@ class TestPortal:
         assert "Research Data Portal" in r.text
 
     def test_register_issues_working_key(self):
-        r = client.post("/portal/register", json={"name": "Ada Lovelace", "email": "ada@rs.org"})
+        r = client.post("/api/portal/register", json={"name": "Ada Lovelace", "email": "ada@rs.org"})
         assert r.status_code == 201
         body = r.json()
         key = body["api_key"]
@@ -71,35 +76,35 @@ class TestPortal:
         assert body["name"] == "Ada Lovelace"
         assert "expires_at" in body
         # The issued key authenticates real API calls.
-        assert client.get("/fields", headers={"X-API-Key": key}).status_code == 200
-        assert client.get("/tables", headers={"X-API-Key": key}).status_code == 200
+        assert client.get("/api/fields", headers={"X-API-Key": key}).status_code == 200
+        assert client.get("/api/tables", headers={"X-API-Key": key}).status_code == 200
 
     def test_issued_key_can_be_revoked(self):
         key = client.post(
-            "/portal/register", json={"name": "Grace", "email": "grace@navy.mil"}
+            "/api/portal/register", json={"name": "Grace", "email": "grace@navy.mil"}
         ).json()["api_key"]
         hdr = {"X-API-Key": key}
-        assert client.get("/fields", headers=hdr).status_code == 200
-        assert client.delete("/portal/key", headers=hdr).json()["revoked"] is True
+        assert client.get("/api/fields", headers=hdr).status_code == 200
+        assert client.delete("/api/portal/key", headers=hdr).json()["revoked"] is True
         # Revoked key no longer authenticates.
-        assert client.get("/fields", headers=hdr).status_code == 401
+        assert client.get("/api/fields", headers=hdr).status_code == 401
 
     def test_configured_key_cannot_be_revoked(self):
-        assert client.delete("/portal/key", headers=ALICE).status_code == 400
+        assert client.delete("/api/portal/key", headers=ALICE).status_code == 400
 
     def test_register_bad_email_is_400(self):
-        r = client.post("/portal/register", json={"name": "Ada", "email": "not-an-email"})
+        r = client.post("/api/portal/register", json={"name": "Ada", "email": "not-an-email"})
         assert r.status_code == 400
 
     def test_register_whitespace_name_is_400(self):
-        r = client.post("/portal/register", json={"name": "   ", "email": "ada@rs.org"})
+        r = client.post("/api/portal/register", json={"name": "   ", "email": "ada@rs.org"})
         assert r.status_code == 400
 
     def test_register_missing_field_is_422(self):
-        assert client.post("/portal/register", json={"name": "Ada"}).status_code == 422
+        assert client.post("/api/portal/register", json={"name": "Ada"}).status_code == 422
 
     def test_unknown_issued_key_rejected(self):
-        assert client.get("/fields", headers={"X-API-Key": "rk_deadbeef"}).status_code == 401
+        assert client.get("/api/fields", headers={"X-API-Key": "rk_deadbeef"}).status_code == 401
 
     def test_register_rate_limited(self):
         # Use an isolated store + a low limit so we exercise the 429 path without
@@ -111,7 +116,7 @@ class TestPortal:
         main.REGISTER_MAX_PER_WINDOW = 3
         try:
             statuses = [
-                client.post("/portal/register", json={"name": f"R{i}", "email": f"r{i}@x.org"}).status_code
+                client.post("/api/portal/register", json={"name": f"R{i}", "email": f"r{i}@x.org"}).status_code
                 for i in range(5)
             ]
             assert statuses == [201, 201, 201, 429, 429]
@@ -171,13 +176,13 @@ class TestKeyStore:
 
 class TestAuth:
     def test_no_key_is_401(self):
-        assert client.get("/tables").status_code == 401
+        assert client.get("/api/tables").status_code == 401
 
     def test_bad_key_is_401(self):
-        assert client.get("/tables", headers={"X-API-Key": "bogus"}).status_code == 401
+        assert client.get("/api/tables", headers={"X-API-Key": "bogus"}).status_code == 401
 
     def test_valid_key_ok(self):
-        r = client.get("/tables", headers=ALICE)
+        r = client.get("/api/tables", headers=ALICE)
         assert r.status_code == 200
         assert [t["name"] for t in r.json()["tables"]]
 
@@ -186,7 +191,7 @@ class TestAuth:
 
 class TestSchema:
     def test_tables_lists_report_tables(self):
-        r = client.get("/tables", headers=ALICE)
+        r = client.get("/api/tables", headers=ALICE)
         assert r.status_code == 200
         body = r.json()
         names = [t["name"] for t in body["tables"]]
@@ -194,26 +199,26 @@ class TestSchema:
         assert body["period"] == "2025-07-01/2025-12-31"
 
     def test_known_table_schema(self):
-        r = client.get("/schema/t4_notices", headers=ALICE)
+        r = client.get("/api/schema/t4_notices", headers=ALICE)
         assert r.status_code == 200
         body = r.json()
         assert "service_name" in body["dimensions"]["fields"]
         assert "notices" in body["measures"]["fields"]
 
     def test_missing_table_is_404(self):
-        assert client.get("/schema/nonexistent", headers=ALICE).status_code == 404
+        assert client.get("/api/schema/nonexistent", headers=ALICE).status_code == 404
 
 
 # ── Fields discovery ──────────────────────────────────────────────────────────
 
 class TestFields:
     def test_overview_lists_tables(self):
-        r = client.get("/fields", headers=ALICE)
+        r = client.get("/api/fields", headers=ALICE)
         assert r.status_code == 200
         assert "t4_notices" in r.json()["tables"]
 
     def test_per_table_fields(self):
-        r = client.get("/fields?table=t4_notices", headers=ALICE)
+        r = client.get("/api/fields?table=t4_notices", headers=ALICE)
         assert r.status_code == 200
         body = r.json()
         assert "service_name" in body["dimensions"]["fields"]
@@ -221,25 +226,25 @@ class TestFields:
         assert "SUM" in body["aggregate_functions"]
 
     def test_unknown_table_is_404(self):
-        assert client.get("/fields?table=nope", headers=ALICE).status_code == 404
+        assert client.get("/api/fields?table=nope", headers=ALICE).status_code == 404
 
     def test_fields_requires_auth(self):
-        assert client.get("/fields").status_code == 401
+        assert client.get("/api/fields").status_code == 401
 
 
 # ── Query lifecycle ───────────────────────────────────────────────────────────
 
 class TestQueryLifecycle:
     def test_submit_returns_202_with_location(self):
-        r = client.post("/query", json=COUNT_ALL, headers=ALICE)
+        r = client.post("/api/query", json=COUNT_ALL, headers=ALICE)
         assert r.status_code == 202
         assert "job_id" in r.json()
-        assert r.headers.get("location", "").startswith("/jobs/")
+        assert r.headers.get("location", "").startswith("/api/jobs/")
 
     def test_happy_path_json(self):
         job = _submit_and_wait(COUNT_ALL)
         assert job["status"] == "done"
-        r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        r = client.get(f"/api/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         assert r.status_code == 200
         body = r.json()
         assert body["row_count"] == 1
@@ -254,7 +259,7 @@ class TestQueryLifecycle:
                 "sort": [{"field_name": "service_name", "order": "asc"}],
             }
         )
-        r = client.get(f"/jobs/{job['job_id']}/result?format=csv", headers=ALICE)
+        r = client.get(f"/api/jobs/{job['job_id']}/result?format=csv", headers=ALICE)
         assert r.status_code == 200
         assert "text/csv" in r.headers["content-type"]
         lines = r.text.strip().splitlines()
@@ -280,7 +285,7 @@ class TestQueryLifecycle:
             }
         )
         assert job["status"] == "done"
-        r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        r = client.get(f"/api/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         body = r.json()
         assert body["columns"] == ["service_name", "notices"]
         # YouTube t4 rows in conftest: notices 100 + 40 = 140.
@@ -288,7 +293,7 @@ class TestQueryLifecycle:
 
     def test_compiled_sql_is_parameterised(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={
                 "table": "t4_notices",
                 "query": {
@@ -305,16 +310,16 @@ class TestQueryLifecycle:
         assert "YouTube" not in job["compiled_sql"]
 
     def test_result_before_done_is_409(self):
-        r = client.post("/query", json=COUNT_ALL, headers=ALICE)
+        r = client.post("/api/query", json=COUNT_ALL, headers=ALICE)
         job_id = r.json()["job_id"]
         # Job may already be done by the time we hit the result endpoint,
         # but if it's still in-flight we expect 409.
-        r2 = client.get(f"/jobs/{job_id}/result", headers=ALICE)
+        r2 = client.get(f"/api/jobs/{job_id}/result", headers=ALICE)
         assert r2.status_code in (200, 409)
 
     def test_list_jobs(self):
         _submit_and_wait(COUNT_ALL)
-        r = client.get("/jobs", headers=ALICE)
+        r = client.get("/api/jobs", headers=ALICE)
         assert r.status_code == 200
         assert len(r.json()["jobs"]) >= 1
 
@@ -365,7 +370,7 @@ class TestSecureDownload:
         # Forge a correctly-signed but already-expired link.
         expires = 1
         sig = _download_signature(job_id, "json", expires)
-        r = client.get(f"/jobs/{job_id}/download?format=json&expires={expires}&sig={sig}")
+        r = client.get(f"/api/jobs/{job_id}/download?format=json&expires={expires}&sig={sig}")
         assert r.status_code == 410
 
     def test_signature_bound_to_format(self):
@@ -377,7 +382,7 @@ class TestSecureDownload:
     def test_unknown_job_download_is_403(self):
         # Signature is verified before any store lookup, so an unknown job id with
         # an invalid signature returns 403 (not 404) — existence isn't leaked.
-        r = client.get("/jobs/doesnotexist/download?format=json&expires=99999999999&sig=abc")
+        r = client.get("/api/jobs/doesnotexist/download?format=json&expires=99999999999&sig=abc")
         assert r.status_code == 403
 
 
@@ -386,11 +391,11 @@ class TestSecureDownload:
 class TestJobIsolation:
     def test_bob_cannot_see_alices_job(self):
         job = _submit_and_wait(COUNT_ALL)
-        assert client.get(f"/jobs/{job['job_id']}", headers=BOB).status_code == 404
+        assert client.get(f"/api/jobs/{job['job_id']}", headers=BOB).status_code == 404
 
     def test_bob_cannot_fetch_alices_result(self):
         job = _submit_and_wait(COUNT_ALL)
-        r = client.get(f"/jobs/{job['job_id']}/result", headers=BOB)
+        r = client.get(f"/api/jobs/{job['job_id']}/result", headers=BOB)
         assert r.status_code == 404
 
 
@@ -398,17 +403,17 @@ class TestJobIsolation:
 
 class TestSafety:
     def test_missing_table_is_400(self):
-        r = client.post("/query", json={"aggregates": [{"function": "COUNT", "alias": "n"}]}, headers=ALICE)
+        r = client.post("/api/query", json={"aggregates": [{"function": "COUNT", "alias": "n"}]}, headers=ALICE)
         assert r.status_code == 400
 
     def test_unknown_table_is_400(self):
-        r = client.post("/query", json={"table": "t99_nope", "fields": ["service_name"]}, headers=ALICE)
+        r = client.post("/api/query", json={"table": "t99_nope", "fields": ["service_name"]}, headers=ALICE)
         assert r.status_code == 400
 
     def test_field_from_other_table_is_400(self):
         # `notices` belongs to t4, not t3 — it must not be accepted for t3.
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t3_member_state_orders", "fields": ["notices"]},
             headers=ALICE,
         )
@@ -416,7 +421,7 @@ class TestSafety:
 
     def test_unknown_field_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t4_notices", "query": {"and": [{"operation": "EQ", "field_name": "secrets", "field_values": ["x"]}]}},
             headers=ALICE,
         )
@@ -424,7 +429,7 @@ class TestSafety:
 
     def test_comparator_on_text_field_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t4_notices", "query": {"and": [{"operation": "GT", "field_name": "service_name", "field_values": [5]}]}},
             headers=ALICE,
         )
@@ -432,7 +437,7 @@ class TestSafety:
 
     def test_bad_alias_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t4_notices", "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "x); DROP"}]},
             headers=ALICE,
         )
@@ -456,18 +461,18 @@ class TestSafety:
             }
         )
         assert job["status"] == "done"
-        r = client.get(f"/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        r = client.get(f"/api/jobs/{job['job_id']}/result?format=json", headers=ALICE)
         assert r.json()["row_count"] == 0
         # DB still intact afterwards — a follow-up count still works.
         again = _submit_and_wait(COUNT_ALL)
-        r2 = client.get(f"/jobs/{again['job_id']}/result?format=json", headers=ALICE)
+        r2 = client.get(f"/api/jobs/{again['job_id']}/result?format=json", headers=ALICE)
         assert r2.json()["rows"][0][0] == 3
 
     def test_dimension_requires_string(self):
         # A numeric value on a TEXT dimension would silently match nothing under
         # SQLite affinity rules, so it is rejected up front.
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t4_notices", "query": {"and": [{"operation": "EQ", "field_name": "service_name", "field_values": [123]}]}},
             headers=ALICE,
         )
@@ -475,7 +480,7 @@ class TestSafety:
 
     def test_duplicate_group_by_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={
                 "table": "t4_notices",
                 "group_by": ["service_name", "service_name"],
@@ -487,7 +492,7 @@ class TestSafety:
 
     def test_alias_clashing_with_group_by_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={
                 "table": "t4_notices",
                 "group_by": ["service_name"],
@@ -499,7 +504,7 @@ class TestSafety:
 
     def test_duplicate_field_is_400(self):
         r = client.post(
-            "/query",
+            "/api/query",
             json={"table": "t4_notices", "fields": ["service_name", "service_name"]},
             headers=ALICE,
         )
@@ -508,13 +513,13 @@ class TestSafety:
     def test_extra_sql_field_ignored(self):
         # The model has no free-form `sql` field; an extra one is ignored, and the
         # query runs the validated default SELECT for the named table.
-        r = client.post("/query", json={"table": "t4_notices", "sql": "DROP TABLE services"}, headers=ALICE)
+        r = client.post("/api/query", json={"table": "t4_notices", "sql": "DROP TABLE services"}, headers=ALICE)
         assert r.status_code == 202
         job = _wait_for_job(r.json()["job_id"], ALICE)
         assert job["status"] == "done"  # ran the default SELECT, not the DROP
 
     def test_unknown_job_is_404(self):
-        assert client.get("/jobs/doesnotexist", headers=ALICE).status_code == 404
+        assert client.get("/api/jobs/doesnotexist", headers=ALICE).status_code == 404
 
 
 # ── Cancel / delete ───────────────────────────────────────────────────────────
@@ -523,10 +528,10 @@ class TestDelete:
     def test_delete_completed_job(self):
         job = _submit_and_wait(COUNT_ALL)
         job_id = job["job_id"]
-        r = client.delete(f"/jobs/{job_id}", headers=ALICE)
+        r = client.delete(f"/api/jobs/{job_id}", headers=ALICE)
         assert r.status_code == 200
         assert r.json()["deleted"] is True
-        assert client.get(f"/jobs/{job_id}", headers=ALICE).status_code == 404
+        assert client.get(f"/api/jobs/{job_id}", headers=ALICE).status_code == 404
 
 
 # ── Query rate limiting ─────────────────────────────────────────────────────────
@@ -539,9 +544,9 @@ class TestQueryRateLimit:
         main._key_store = main.MemoryKeyStore()  # isolated, so it doesn't affect other tests
         main.QUERY_RATE_MAX = 2
         try:
-            statuses = [client.post("/query", json=COUNT_ALL, headers=ALICE).status_code for _ in range(4)]
+            statuses = [client.post("/api/query", json=COUNT_ALL, headers=ALICE).status_code for _ in range(4)]
             assert statuses == [202, 202, 429, 429]
-            r = client.post("/query", json=COUNT_ALL, headers=ALICE)
+            r = client.post("/api/query", json=COUNT_ALL, headers=ALICE)
             assert r.status_code == 429 and r.headers["Retry-After"] == str(main.QUERY_RATE_WINDOW)
         finally:
             main._key_store, main.QUERY_RATE_MAX = original_store, original_max
@@ -553,10 +558,10 @@ class TestQueryRateLimit:
         main._key_store = main.MemoryKeyStore()
         main.QUERY_RATE_MAX = 1
         try:
-            assert client.post("/query", json=COUNT_ALL, headers=ALICE).status_code == 202
-            assert client.post("/query", json=COUNT_ALL, headers=ALICE).status_code == 429
+            assert client.post("/api/query", json=COUNT_ALL, headers=ALICE).status_code == 202
+            assert client.post("/api/query", json=COUNT_ALL, headers=ALICE).status_code == 429
             # bob has his own bucket and is unaffected
-            assert client.post("/query", json=COUNT_ALL, headers=BOB).status_code == 202
+            assert client.post("/api/query", json=COUNT_ALL, headers=BOB).status_code == 202
         finally:
             main._key_store, main.QUERY_RATE_MAX = original_store, original_max
 
@@ -670,9 +675,9 @@ class TestMetrics:
     def test_request_counter_uses_route_template_not_raw_path(self):
         # A job id in the URL must not leak into label cardinality.
         job = _submit_and_wait(COUNT_ALL)
-        client.get(f"/jobs/{job['job_id']}", headers=ALICE)
+        client.get(f"/api/jobs/{job['job_id']}", headers=ALICE)
         body = client.get("/metrics").text
-        assert 'path="/jobs/{job_id}"' in body
+        assert 'path="/api/jobs/{job_id}"' in body
         assert job["job_id"] not in body  # the literal id is never a label value
 
     def test_job_completion_increments_jobs_total(self):
@@ -696,13 +701,13 @@ class TestMetrics:
 class TestCallbacks:
     def test_bad_scheme_rejected_at_submit(self):
         r = client.post(
-            "/query", json={**COUNT_ALL, "callback_url": "ftp://example.com/hook"}, headers=ALICE
+            "/api/query", json={**COUNT_ALL, "callback_url": "ftp://example.com/hook"}, headers=ALICE
         )
         assert r.status_code == 400
 
     def test_missing_host_rejected_at_submit(self):
         r = client.post(
-            "/query", json={**COUNT_ALL, "callback_url": "http:///nohost"}, headers=ALICE
+            "/api/query", json={**COUNT_ALL, "callback_url": "http:///nohost"}, headers=ALICE
         )
         assert r.status_code == 400
 
@@ -822,7 +827,7 @@ class TestGoogleAuth:
         yield
 
     def _signin(self, email):
-        return client.post("/auth/google", json={"credential": email})
+        return client.post("/api/auth/google", json={"credential": email})
 
     def test_new_user_is_pending(self):
         r = self._signin("newbie@example.com")
@@ -836,7 +841,7 @@ class TestGoogleAuth:
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "approved"
-        assert client.get("/tables", headers={"X-API-Key": body["api_key"]}).status_code == 200
+        assert client.get("/api/tables", headers={"X-API-Key": body["api_key"]}).status_code == 200
 
     def test_invalid_credential_is_401(self):
         assert self._signin("BAD").status_code == 401
@@ -847,28 +852,28 @@ class TestGoogleAuth:
     def test_approval_flow_issues_working_key(self):
         assert self._signin("res@example.com").status_code == 202
         admin_key = self._signin("admin@example.com").json()["api_key"]
-        appr = client.post("/admin/registrations/res@example.com/approve",
+        appr = client.post("/api/admin/registrations/res@example.com/approve",
                            headers={"X-API-Key": admin_key})
         assert appr.status_code == 200 and appr.json()["status"] == "approved"
         r = self._signin("res@example.com")
         assert r.status_code == 200
-        assert client.get("/tables", headers={"X-API-Key": r.json()["api_key"]}).status_code == 200
+        assert client.get("/api/tables", headers={"X-API-Key": r.json()["api_key"]}).status_code == 200
 
     def test_non_admin_cannot_reach_admin_endpoints(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]
-        client.post("/admin/registrations/u@example.com/approve", headers={"X-API-Key": admin_key})
+        client.post("/api/admin/registrations/u@example.com/approve", headers={"X-API-Key": admin_key})
         user_key = self._signin("u@example.com").json()["api_key"]
-        assert client.get("/admin/registrations", headers={"X-API-Key": user_key}).status_code == 403
-        assert client.get("/admin/registrations").status_code == 401
+        assert client.get("/api/admin/registrations", headers={"X-API-Key": user_key}).status_code == 403
+        assert client.get("/api/admin/registrations").status_code == 401
 
     def test_revoke_invalidates_live_session(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]
-        client.post("/admin/registrations/r3@example.com/approve", headers={"X-API-Key": admin_key})
+        client.post("/api/admin/registrations/r3@example.com/approve", headers={"X-API-Key": admin_key})
         user_key = self._signin("r3@example.com").json()["api_key"]
-        assert client.get("/tables", headers={"X-API-Key": user_key}).status_code == 200
-        client.post("/admin/registrations/r3@example.com/revoke", headers={"X-API-Key": admin_key})
+        assert client.get("/api/tables", headers={"X-API-Key": user_key}).status_code == 200
+        client.post("/api/admin/registrations/r3@example.com/revoke", headers={"X-API-Key": admin_key})
         # The live session stops working immediately (re-checked on every request).
-        assert client.get("/tables", headers={"X-API-Key": user_key}).status_code == 401
+        assert client.get("/api/tables", headers={"X-API-Key": user_key}).status_code == 401
         # And a fresh sign-in is rejected as revoked.
         assert self._signin("r3@example.com").status_code == 403
 
@@ -876,14 +881,14 @@ class TestGoogleAuth:
         admin_key = self._signin("admin@example.com").json()["api_key"]
         self._signin("p1@example.com")
         self._signin("p2@example.com")
-        body = client.get("/admin/registrations?status=pending",
+        body = client.get("/api/admin/registrations?status=pending",
                           headers={"X-API-Key": admin_key}).json()
         emails = {r["email"] for r in body["registrations"]}
         assert {"p1@example.com", "p2@example.com"} <= emails
 
     def test_cannot_revoke_admin(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]
-        r = client.post("/admin/registrations/admin@example.com/revoke",
+        r = client.post("/api/admin/registrations/admin@example.com/revoke",
                         headers={"X-API-Key": admin_key})
         assert r.status_code == 400
 
@@ -921,3 +926,23 @@ class TestVersion:
     def test_nosniff_header_on_every_response(self):
         r = client.get("/healthz")
         assert r.headers.get("X-Content-Type-Options") == "nosniff"
+
+
+# ── Combined site: dashboard + public overview ───────────────────────────────
+
+class TestDashboard:
+    def test_overview_is_public_and_populated(self):
+        r = client.get("/api/overview")  # no X-API-Key
+        assert r.status_code == 200
+        d = r.json()
+        assert d["services"] > 0 and d["platforms"] > 0
+        assert d["total_notices"] >= 0
+        assert isinstance(d["top_platforms"], list) and d["top_platforms"]
+        assert {"platform", "notices"} <= set(d["top_platforms"][0])
+        assert isinstance(d["by_category"], list)
+        assert "period" in d
+
+    def test_dashboard_served_at_root(self):
+        r = client.get("/")
+        assert r.status_code == 200 and "text/html" in r.headers["content-type"]
+        assert "/api/overview" in r.text  # dashboard fetches the public overview
