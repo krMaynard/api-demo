@@ -40,13 +40,20 @@ Built to demonstrate two things:
 | `requirements.txt` | `fastapi` + `uvicorn[standard]` |
 | `demo.db` | SQLite DB (git-ignored, produced by `seed.py`) |
 | `.github/workflows/ci.yml` | CI: `pyflakes` lint + `pytest` on every PR/push (Python 3.11 & 3.12) |
+| `.github/workflows/deploy.yml` | CD: build/push image + deploy to Cloud Run on push to `main` (WIF; skips until configured) |
+| `.gcloudignore` | Trims the Cloud Build upload context (keeps Dockerfile + `data/`) |
 
 ## CI
 
 GitHub Actions runs `pyflakes main.py seed.py demo.py conftest.py test_api.py`
-and `pytest test_api.py` on every pull request and push to `main`. Keep both
-green — the suite is hermetic (no Redis/server/`demo.db` needed; `conftest.py`
-builds a temp DB). Run them locally before pushing.
+and `pytest test_api.py` on every pull request and push to `main` (`ci.yml`).
+Keep both green — the suite is hermetic (no Redis/server/`demo.db` needed;
+`conftest.py` builds a temp DB). Run them locally before pushing.
+
+`deploy.yml` builds + pushes the image and rolls a Cloud Run revision on push to
+`main` via Workload Identity Federation. It's gated on the `GCP_PROJECT_ID` repo
+variable, so it **skips** (not fails) until GCP is configured — see README →
+"Continuous deployment". `.gcloudignore` keeps the Cloud Build upload lean.
 
 ## Setup
 

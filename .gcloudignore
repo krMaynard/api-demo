@@ -1,0 +1,30 @@
+# Trim the Cloud Build upload context. Unlike .dockerignore, this must KEEP the
+# Dockerfile and everything it COPYs (requirements.txt, main.py, seed.py,
+# static/, data/). When this file exists, gcloud ignores .gitignore, so list
+# everything to drop here.
+.git
+.github
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+demo.db
+*.sqlite
+*.db
+
+# Dev/demo/test assets not needed to build the image
+test_api.py
+conftest.py
+demo.py
+scripts/
+docs/
+*.md
+.env
+.dockerignore
+.gcloudignore
+service.yaml
+docker-compose.yml

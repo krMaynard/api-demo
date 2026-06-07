@@ -551,6 +551,71 @@ URL (and any custom domain) to its *Authorized JavaScript origins* — that's th
 value of `GOOGLE_CLIENT_ID`. Sign in at `/portal`; the first `ADMIN_EMAILS`
 account is auto-approved and can approve others.
 
+### Continuous deployment (GitHub Actions)
+
+`.github/workflows/deploy.yml` builds the image and rolls a new Cloud Run
+revision on every push to `main`, using **Workload Identity Federation** (no
+service-account keys). It **skips automatically** until you configure it, so it
+never red-Xes an un-provisioned repo. One-time setup:
+
+```bash
+PROJECT_ID=your-project; REGION=us-central1; REPO=your-user/api-demo
+SA=cloud-run-deployer@$PROJECT_ID.iam.gserviceaccount.com
+
+# 1. Deployer service account + roles (build, push, deploy, act-as runtime SA)
+gcloud iam service-accounts create cloud-run-deployer --project "$PROJECT_ID"
+for role in run.admin cloudbuild.builds.editor artifactregistry.writer \
+            iam.serviceAccountUser storage.admin; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:$SA" --role="roles/$role"; done
+
+# 2. Workload Identity pool + GitHub provider, scoped to this repo
+gcloud iam workload-identity-pools create github --location=global --project "$PROJECT_ID"
+gcloud iam workload-identity-pools providers create-oidc github \
+  --location=global --workload-identity-pool=github \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+  --attribute-condition="assertion.repository=='${REPO}'" \
+  --project "$PROJECT_ID"
+POOL=$(gcloud iam workload-identity-pools describe github --location=global --project "$PROJECT_ID" --format='value(name)')
+gcloud iam service-accounts add-iam-policy-binding "$SA" \
+  --project "$PROJECT_ID" \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/${POOL}/attribute.repository/${REPO}"
+```
+
+Then add these under **Settings → Secrets and variables → Actions → Variables**:
+
+| Variable | Value |
+|----------|-------|
+| `GCP_PROJECT_ID` | your project id (presence of this enables the workflow) |
+| `GCP_REGION` | e.g. `us-central1` (default if unset) |
+| `CLOUD_RUN_SERVICE` | e.g. `api-demo` (default if unset) |
+| `ARTIFACT_REPO` | Artifact Registry repo name (default `api-demo`) |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/NUM/locations/global/workloadIdentityPools/github/providers/github` |
+| `GCP_SERVICE_ACCOUNT` | the deployer SA email above |
+| `DEPLOY` | optional — set to `false` to build & push only (no deploy) |
+
+Do the **first** deploy with `service.yaml` (it sets env/secrets/scaling); the
+Action thereafter just ships new image revisions, preserving that config.
+
+### Custom domain
+
+Map a domain to the service (or use Cloud Run's built-in domain mapping / a
+load balancer):
+
+```bash
+gcloud beta run domain-mappings create --service api-demo \
+  --domain api.example.com --region "$REGION" --project "$PROJECT_ID"
+# Then add the shown DNS records at your registrar.
+```
+
+After it resolves, also: add the domain to the OAuth client's *Authorized
+JavaScript origins*, and set `PUBLIC_BASE_URL=https://api.example.com` (so
+callback/download links are absolute). Note that the domain must be a real,
+registrable public TLD — pick a delegated TLD (e.g. `.org`, `.eu`, `.dev`) or a
+subdomain of one; non-delegated names like `.data` won't resolve publicly.
+
 For other targets (Railway, Fly.io) and deeper hardening, see `PRODUCTIONIZE.md`.
 
 ## Running the tests
