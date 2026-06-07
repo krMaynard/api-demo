@@ -104,7 +104,7 @@ ALLOW_DEMO_KEYS = os.getenv("ALLOW_DEMO_KEYS", "1").lower() in ("1", "true", "ye
 # Deployed build identifier — the CD workflow injects the commit SHA as APP_VERSION
 # on each Cloud Run revision; defaults to "dev" locally. Surfaced at GET /version
 # and in the X-Version response header so you can confirm what's actually live.
-APP_VERSION = os.getenv("APP_VERSION", "dev")
+APP_VERSION = os.getenv("APP_VERSION") or "dev"
 # Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
 # overwrites it. Off by default: trusting it unconditionally would let any client
 # spoof the header to dodge the registration rate limit.
