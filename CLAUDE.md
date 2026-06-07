@@ -72,11 +72,24 @@ python demo.py --pause   # press Enter between steps (live demo mode)
 
 ## Auth
 
-Demo API keys are hard-coded in `main.py` as `alice` and `bob`.
-Pass via `X-API-Key` header. Jobs are scoped per key — each user only sees
-their own jobs (foreign IDs return 404, not 403).
+Two mechanisms, both presented as `X-API-Key` to the rest of the app:
 
-In production these would come from a secret store.
+- **Google sign-in (production).** The frontend uses Google Identity Services
+  (FedCM in supporting browsers) to get an ID token and POSTs it to
+  `/auth/google`. `_verify_id_token` validates it against `GOOGLE_CLIENT_ID`.
+  New accounts become a `pending` registration; an admin (`ADMIN_EMAILS`,
+  comma-separated, implicitly approved) approves via `/admin/registrations/*`.
+  An approved login mints a first-party **session key** (`gs_…`) into
+  `_key_store` (TTL `GOOGLE_SESSION_TTL`). `_lookup_principal` re-checks the
+  registration on every request, so an admin revoke kills live sessions at once.
+  Durable approval state lives in `_registrations` (Redis-backed when configured,
+  else in-memory — same pattern as `_key_store`).
+- **Demo keys (dev).** Hard-coded `alice`/`bob` + the open `/portal/register`.
+  Gated by `ALLOW_DEMO_KEYS` (default on); set `ALLOW_DEMO_KEYS=0` in production.
+
+Jobs are scoped per key — each principal only sees their own jobs (foreign IDs
+return 404, not 403). `require_admin` gates the admin endpoints on the principal's
+email being in `ADMIN_EMAILS`.
 
 ## Database schema
 
@@ -192,8 +205,12 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 |--------|------|------|-------|
 | GET | `/` | — | Service info |
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
-| POST | `/portal/register` | — | Issue a demo API key (`{name, email}`) — rate-limited, expiring |
-| DELETE | `/portal/key` | key | Revoke your own portal-issued key |
+| POST | `/auth/google` | — | Verify a Google ID token → session key, or `202` pending approval |
+| POST | `/portal/register` | — | Demo: issue a key without auth (`ALLOW_DEMO_KEYS`) |
+| DELETE | `/portal/key` | key | Revoke your own session / portal-issued key |
+| GET | `/admin/registrations` | admin | List researcher registrations (`?status=`) |
+| POST | `/admin/registrations/{email}/approve` | admin | Approve an account |
+| POST | `/admin/registrations/{email}/revoke` | admin | Revoke an account |
 | GET | `/tables` | key | List the DSA report tables + dataset period |
 | GET | `/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |
 | GET | `/schema/{table}` | key | Field registry for a report table |

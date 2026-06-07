@@ -51,6 +51,9 @@ seed.build_db(_FIXTURE, _DB)
 
 os.environ.setdefault("DB_PATH", _DB)
 os.environ.setdefault("API_KEYS_JSON", '{"alice":{"name":"alice"},"bob":{"name":"bob"}}')
+# Google sign-in config for the auth tests (token verification is monkeypatched).
+os.environ.setdefault("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
+os.environ.setdefault("ADMIN_EMAILS", "admin@example.com")
 # Don't let the rate limiters interfere with the HTTP tests (they share one
 # TestClient IP / API key). The 429 paths are exercised with isolated stores.
 os.environ.setdefault("PORTAL_REGISTER_MAX_PER_WINDOW", "10000")

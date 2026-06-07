@@ -87,6 +87,19 @@ DOWNLOAD_URL_TTL = int(os.getenv("DOWNLOAD_URL_TTL_SECONDS", "3600"))
 ISSUED_KEY_TTL = int(os.getenv("ISSUED_KEY_TTL_SECONDS", str(30 * 24 * 3600)))
 REGISTER_MAX_PER_WINDOW = int(os.getenv("PORTAL_REGISTER_MAX_PER_WINDOW", "10"))
 REGISTER_WINDOW = int(os.getenv("PORTAL_REGISTER_WINDOW_SECONDS", "3600"))
+# Google sign-in (FedCM via Google Identity Services). GOOGLE_CLIENT_ID is your
+# OAuth 2.0 Web client ID (the `aud` we verify ID tokens against). ADMIN_EMAILS is
+# a comma-separated allowlist of accounts that are implicitly approved and may
+# approve/revoke other researchers. A successful login mints a first-party session
+# key into the issued-key store, living GOOGLE_SESSION_TTL seconds.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+ADMIN_EMAILS = frozenset(
+    e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
+)
+GOOGLE_SESSION_TTL = int(os.getenv("GOOGLE_SESSION_TTL_SECONDS", str(7 * 24 * 3600)))
+# Demo auth (hardcoded alice/bob keys + the open /portal/register flow). Handy for
+# local dev; set ALLOW_DEMO_KEYS=0 in production so only Google sign-in works.
+ALLOW_DEMO_KEYS = os.getenv("ALLOW_DEMO_KEYS", "1").lower() in ("1", "true", "yes")
 # Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
 # overwrites it. Off by default: trusting it unconditionally would let any client
 # spoof the header to dodge the registration rate limit.
@@ -171,18 +184,29 @@ def _load_api_keys() -> dict[str, dict[str, str]]:
     raw = os.getenv("API_KEYS_JSON")
     if raw:
         return json.loads(raw)
-    # Demo fallback — replace with a secret store in production.
-    return {"alice": {"name": "alice"}, "bob": {"name": "bob"}}
+    if ALLOW_DEMO_KEYS:
+        # Demo fallback — disabled when ALLOW_DEMO_KEYS=0 (production).
+        return {"alice": {"name": "alice"}, "bob": {"name": "bob"}}
+    return {}
 
 
 API_KEYS = _load_api_keys()
 
 
 def _lookup_principal(key: str) -> dict[str, str] | None:
-    """Resolve a key to its principal: a configured key, or an issued portal key."""
+    """Resolve a key to its principal: a configured key, an issued portal key, or
+    a Google session. Google sessions are re-checked against the registration on
+    every use, so an admin revoke takes effect immediately (not just at TTL)."""
     if key in API_KEYS:
         return API_KEYS[key]
-    return _key_store.get(key)  # None if unknown or expired
+    rec = _key_store.get(key)  # None if unknown or expired
+    if rec is None:
+        return None
+    if rec.get("auth") == "google":
+        reg = _registrations.get(rec.get("email", ""))
+        if reg is None or reg.get("status") != "approved":
+            return None
+    return rec
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -198,6 +222,13 @@ def require_api_key(key: str | None = Depends(api_key_header)) -> dict[str, str]
             detail="Missing or invalid API key. Set header `X-API-Key: <key>`.",
         )
     return {"key": key, **principal}
+
+
+def require_admin(principal: dict = Depends(require_api_key)) -> dict[str, str]:
+    """Admin = an authenticated principal whose email is in ADMIN_EMAILS."""
+    if str(principal.get("email", "")).lower() not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return principal
 
 
 # ── Secure download URLs ──────────────────────────────────────────────────────
@@ -564,6 +595,63 @@ class RedisKeyStore:
         return n
 
 
+# Researcher registrations (Google sign-in + admin approval). Durable approval
+# state keyed by lowercased email — NOT expiring like session keys. Listable so an
+# admin can see who's pending.
+
+
+class MemoryRegistrationStore:
+    """Single-process registration store."""
+
+    def __init__(self) -> None:
+        self._recs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def upsert(self, email: str, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._recs[email] = record
+
+    def get(self, email: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._recs.get(email)
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._recs.values())
+
+    def delete(self, email: str) -> bool:
+        with self._lock:
+            return self._recs.pop(email, None) is not None
+
+
+class RedisRegistrationStore:
+    """Redis-backed registrations; an index set makes them listable."""
+
+    def __init__(self, client: Any) -> None:
+        self._r = client
+
+    def upsert(self, email: str, record: dict[str, Any]) -> None:
+        self._r.set(f"reg:{email}", json.dumps(record))
+        self._r.sadd("reg:index", email)
+
+    def get(self, email: str) -> dict[str, Any] | None:
+        raw = self._r.get(f"reg:{email}")
+        return json.loads(raw) if raw else None
+
+    def list(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for e in self._r.smembers("reg:index"):
+            email = e.decode() if isinstance(e, bytes) else e
+            rec = self.get(email)
+            if rec:
+                out.append(rec)
+        return out
+
+    def delete(self, email: str) -> bool:
+        self._r.srem("reg:index", email)
+        return bool(self._r.delete(f"reg:{email}"))
+
+
 def _make_store() -> MemoryJobStore | RedisJobStore:
     return RedisJobStore(_redis) if _redis is not None else MemoryJobStore()
 
@@ -572,9 +660,14 @@ def _make_key_store() -> MemoryKeyStore | RedisKeyStore:
     return RedisKeyStore(_redis) if _redis is not None else MemoryKeyStore()
 
 
+def _make_registration_store() -> MemoryRegistrationStore | RedisRegistrationStore:
+    return RedisRegistrationStore(_redis) if _redis is not None else MemoryRegistrationStore()
+
+
 _redis = _make_redis_client()
 _store: MemoryJobStore | RedisJobStore = _make_store()
 _key_store: MemoryKeyStore | RedisKeyStore = _make_key_store()
+_registrations: MemoryRegistrationStore | RedisRegistrationStore = _make_registration_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
 # Webhook delivery runs on its own bounded pool so a flood of callbacks (or slow
 # receivers during retry backoff) can't exhaust threads or starve query workers.
@@ -1162,8 +1255,12 @@ def root() -> dict[str, Any]:
         "auth": "X-API-Key header required for all endpoints except `/`, `/docs`, `/openapi.json`",
         "endpoints": {
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
-            "POST /portal/register": "Issue a demo API key for a researcher (rate-limited, expiring)",
-            "DELETE /portal/key": "Revoke your portal-issued key",
+            "POST /auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key, or pending approval",
+            "POST /portal/register": "Demo: issue an API key without auth (disabled when ALLOW_DEMO_KEYS=0)",
+            "DELETE /portal/key": "Revoke your session / portal-issued key",
+            "GET /admin/registrations": "Admin: list researcher registrations",
+            "POST /admin/registrations/{email}/approve": "Admin: approve an account",
+            "POST /admin/registrations/{email}/revoke": "Admin: revoke an account",
             "POST /query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
@@ -1182,6 +1279,11 @@ def root() -> dict[str, Any]:
         "row_limit": ROW_LIMIT,
         "worker_threads": WORKER_THREADS,
         "store": "upstash" if UPSTASH_REDIS_REST_URL else ("redis" if REDIS_URL else "memory"),
+        "auth_config": {
+            "google_signin": bool(GOOGLE_CLIENT_ID),
+            "google_client_id": GOOGLE_CLIENT_ID or None,
+            "demo_keys": ALLOW_DEMO_KEYS,
+        },
     }
 
 
@@ -1196,6 +1298,41 @@ def root() -> dict[str, Any]:
 class RegisterRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120, description="Researcher's name.")
     email: str = Field(..., min_length=3, max_length=254, description="Contact email.")
+
+
+class GoogleAuthRequest(BaseModel):
+    credential: str = Field(
+        ..., min_length=1, max_length=8192,
+        description="Google ID token (JWT) from Google Identity Services / FedCM.",
+    )
+
+
+def _verify_id_token(credential: str) -> dict[str, Any]:
+    """Verify a Google ID token against GOOGLE_CLIENT_ID; return its claims.
+
+    Raises if the signature/audience/issuer/expiry don't check out. Imported
+    lazily so the dependency (and any network) is only touched when Google
+    sign-in is actually used; tests monkeypatch this function."""
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+
+    return google_id_token.verify_oauth2_token(
+        credential, google_requests.Request(), GOOGLE_CLIENT_ID
+    )
+
+
+def _mint_session(email: str, name: str) -> tuple[str, str]:
+    """Issue a first-party session key for an approved Google account."""
+    key = "gs_" + secrets.token_hex(24)
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=GOOGLE_SESSION_TTL)).isoformat()
+    _key_store.put(
+        key,
+        {"name": name, "email": email, "auth": "google",
+         "created_at": now.isoformat(), "expires_at": expires_at},
+        GOOGLE_SESSION_TTL,
+    )
+    return key, expires_at
 
 
 def _client_ip(request: Request) -> str:
@@ -1222,6 +1359,11 @@ def portal_page() -> FileResponse:
 @app.post("/portal/register", status_code=201)
 def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
     """Issue a demo API key for a researcher (no real authentication)."""
+    if not ALLOW_DEMO_KEYS:
+        raise HTTPException(
+            status_code=404,
+            detail="Demo registration is disabled. Sign in with Google at POST /auth/google.",
+        )
     name = body.name.strip()
     email = body.email.strip()
     if not name:
@@ -1257,12 +1399,106 @@ def portal_register(body: RegisterRequest, request: Request) -> dict[str, Any]:
 
 @app.delete("/portal/key")
 def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
-    """Revoke the calling portal-issued key (configured demo keys can't be revoked)."""
+    """Revoke the calling key/session (configured demo keys can't be revoked)."""
     key = principal["key"]
     if key in API_KEYS:
         raise HTTPException(status_code=400, detail="Configured keys cannot be revoked here.")
     _key_store.delete(key)
     return {"revoked": True}
+
+
+# ── Google sign-in + admin approval ───────────────────────────────────────────
+#
+# Frontend uses Google Identity Services (FedCM in supporting browsers) to obtain
+# an ID token, POSTs it here, and we verify it server-side. New accounts land in a
+# `pending` registration until an admin approves; admins (ADMIN_EMAILS) are
+# implicitly approved. Approved accounts get a first-party session key.
+
+
+@app.post("/auth/google")
+def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -> dict[str, Any]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured on this server.")
+    # Throttle sign-in attempts per IP (reuses the registration limiter window).
+    if _key_store.incr(f"authip:{_client_ip(request)}", REGISTER_WINDOW) > REGISTER_MAX_PER_WINDOW:
+        raise HTTPException(status_code=429, detail="Too many sign-in attempts. Please try again later.")
+
+    try:
+        claims = _verify_id_token(body.credential)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google credential.")
+
+    email = str(claims.get("email", "")).strip().lower()
+    if not email or not claims.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google account has no verified email.")
+    name = claims.get("name") or email
+    now = _now()
+
+    reg = _registrations.get(email)
+    is_admin = email in ADMIN_EMAILS
+    if reg is None:
+        reg = {"email": email, "name": name,
+               "status": "approved" if is_admin else "pending",
+               "requested_at": now, "updated_at": now,
+               "approved_by": "auto:admin" if is_admin else None}
+        _registrations.upsert(email, reg)
+        logger.info("registration_created", extra={"data": {"email": email, "status": reg["status"]}})
+    elif is_admin and reg.get("status") != "approved":
+        reg.update(status="approved", updated_at=now, approved_by="auto:admin")
+        _registrations.upsert(email, reg)
+
+    if reg["status"] == "revoked":
+        raise HTTPException(status_code=403, detail="Your access has been revoked.")
+    if reg["status"] != "approved":
+        response.status_code = 202
+        return {"status": "pending", "email": email,
+                "message": "Your access request is awaiting admin approval."}
+
+    key, expires_at = _mint_session(email, reg.get("name") or name)
+    logger.info("session_minted", extra={"data": {"email": email}})
+    return {"status": "approved", "api_key": key, "name": reg.get("name") or name,
+            "email": email, "expires_at": expires_at, "header": "X-API-Key"}
+
+
+@app.get("/admin/registrations")
+def list_registrations(status: str | None = None, _: dict = Depends(require_admin)) -> dict[str, Any]:
+    """List researcher registrations, optionally filtered by status."""
+    regs = _registrations.list()
+    if status:
+        regs = [r for r in regs if r.get("status") == status]
+    regs.sort(key=lambda r: r.get("requested_at") or "")
+    return {"registrations": regs, "count": len(regs)}
+
+
+@app.post("/admin/registrations/{email}/approve")
+def approve_registration(email: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Approve an account (pre-approval is allowed before the user has signed in)."""
+    email = email.strip().lower()
+    now = _now()
+    reg = _registrations.get(email)
+    if reg is None:
+        reg = {"email": email, "name": email, "status": "approved",
+               "requested_at": now, "updated_at": now, "approved_by": admin.get("email")}
+    else:
+        reg.update(status="approved", updated_at=now, approved_by=admin.get("email"))
+    _registrations.upsert(email, reg)
+    logger.info("registration_approved", extra={"data": {"email": email, "by": admin.get("email")}})
+    return {"email": email, "status": "approved"}
+
+
+@app.post("/admin/registrations/{email}/revoke")
+def revoke_registration(email: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Revoke an account's access (its live sessions stop working immediately)."""
+    email = email.strip().lower()
+    if email in ADMIN_EMAILS:
+        raise HTTPException(status_code=400, detail="Cannot revoke an admin account.")
+    reg = _registrations.get(email)
+    if reg is None:
+        raise HTTPException(status_code=404, detail="No such registration.")
+    reg.update(status="revoked", updated_at=_now(), approved_by=admin.get("email"))
+    _registrations.upsert(email, reg)
+    logger.info("registration_revoked", extra={"data": {"email": email, "by": admin.get("email")}})
+    return {"email": email, "status": "revoked"}
 
 
 @app.get("/healthz")

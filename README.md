@@ -45,19 +45,33 @@ schema (queryable fields + tables/columns) using that key.
 |---|---|---|
 | ![Login](docs/gifs/portal-1-login.gif) | ![Key](docs/gifs/portal-2-key.gif) | ![Schema](docs/gifs/portal-3-schema.gif) |
 
-Open `http://127.0.0.1:8000/portal` after starting the server. It's a demo
-onboarding flow — there's no real authentication (production would sit behind
-SSO) — but the key handling is production-shaped:
+Open `http://127.0.0.1:8000/portal` after starting the server. Issued keys/sessions
+are **persisted in Redis** when `REDIS_URL`/Upstash is configured (surviving restarts,
+shared across workers), falling back to in-memory — same model as the job store.
 
-- `POST /portal/register` issues a key that **expires** after
-  `ISSUED_KEY_TTL_SECONDS` (default 30 days) and works on every API endpoint,
-  exactly like the built-in `alice`/`bob` keys.
-- Issued keys are **persisted in Redis** when `REDIS_URL`/Upstash is configured
-  (so they survive restarts and are shared across workers), falling back to
-  in-memory otherwise — same model as the job store.
-- Registration is **rate-limited** per client IP and per email
-  (`PORTAL_REGISTER_MAX_PER_WINDOW` per `PORTAL_REGISTER_WINDOW_SECONDS`).
-- `DELETE /portal/key` lets a holder **revoke** their own issued key.
+### Sign in with Google (production)
+
+Set `GOOGLE_CLIENT_ID` (an OAuth 2.0 **Web** client ID) and `ADMIN_EMAILS`, and the
+service authenticates real Google accounts via **Google Identity Services** — which
+runs over [**FedCM**](https://developers.google.com/identity/gsi/web/guides/fedcm-migration)
+in supporting browsers, with non-FedCM fallback elsewhere:
+
+- The frontend gets a Google **ID token** and POSTs it to `POST /auth/google`; the
+  server verifies it (signature, `aud=GOOGLE_CLIENT_ID`, issuer, expiry, verified email).
+- A new account becomes a **`pending`** registration (`202`); an **admin** (`ADMIN_EMAILS`,
+  implicitly approved) approves it via `POST /admin/registrations/{email}/approve`.
+- An approved login mints a first-party **session key** (`gs_…`, TTL
+  `GOOGLE_SESSION_TTL_SECONDS`) used as `X-API-Key` like any other.
+- Sessions are **revocable**: `POST /admin/registrations/{email}/revoke` (or
+  `DELETE /portal/key` to sign yourself out) takes effect on the next request, because
+  Google sessions are re-checked against the registration each call.
+
+### Demo keys (local dev)
+
+With `ALLOW_DEMO_KEYS=1` (default), the built-in `alice`/`bob` keys and the open,
+no-auth `POST /portal/register` flow (rate-limited per IP/email, keys expiring after
+`ISSUED_KEY_TTL_SECONDS`) remain available. Set `ALLOW_DEMO_KEYS=0` in production so
+only Google sign-in works.
 
 ## No SQL — structured query parameters
 
@@ -289,8 +303,12 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 |--------|-------------------------------------|------|------------------------------------------------|
 | GET    | `/`                                 | —    | Service info                                   |
 | GET    | `/portal`                           | —    | Researcher portal (web UI)                     |
-| POST   | `/portal/register`                  | —    | Issue a demo API key (`{name, email}`) — rate-limited, expiring |
-| DELETE | `/portal/key`                       | key  | Revoke your own portal-issued key              |
+| POST   | `/auth/google`                      | —    | Verify a Google ID token → session key, or `202` pending approval |
+| POST   | `/portal/register`                  | —    | Demo: issue a key without auth (disabled when `ALLOW_DEMO_KEYS=0`) |
+| DELETE | `/portal/key`                       | key  | Revoke your own session / portal-issued key    |
+| GET    | `/admin/registrations`              | admin| List researcher registrations (`?status=`)     |
+| POST   | `/admin/registrations/{email}/approve` | admin | Approve an account                         |
+| POST   | `/admin/registrations/{email}/revoke`  | admin | Revoke an account (kills live sessions)    |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
 | GET    | `/metrics`                          | —    | Prometheus metrics (scrape over internal net)  |
@@ -465,6 +483,10 @@ All tuneable values are read from environment variables at startup:
 | `REDIS_URL` | _(unset — uses memory)_ | Redis connection URL for persistent job storage |
 | `JOB_TTL_SECONDS` | `86400` | How long to retain jobs in Redis (24 h) |
 | `API_KEYS_JSON` | `alice` / `bob` demo keys | JSON object: `{"<key>": {"name": "<name>"}, …}` |
+| `GOOGLE_CLIENT_ID` | _(unset — sign-in disabled)_ | OAuth 2.0 Web client ID; the `aud` Google ID tokens are verified against |
+| `ADMIN_EMAILS` | _(empty)_ | Comma-separated admin allowlist — implicitly approved, can approve/revoke others |
+| `GOOGLE_SESSION_TTL_SECONDS` | `604800` | Lifetime of a first-party session minted after Google sign-in (7 days) |
+| `ALLOW_DEMO_KEYS` | `1` | Demo `alice`/`bob` keys + open `/portal/register`; set `0` in production |
 | `DOWNLOAD_URL_SECRET` | _(random per process)_ | HMAC secret for signing download URLs — set a stable value in production |
 | `DOWNLOAD_URL_TTL_SECONDS` | `3600` | How long a signed download URL stays valid |
 | `ISSUED_KEY_TTL_SECONDS` | `2592000` | Lifetime of a portal-issued API key (30 days) |
