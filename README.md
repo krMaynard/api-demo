@@ -10,7 +10,7 @@ content-moderation statistics for 33 designated Very Large Online Platforms /
 Search Engines (H2 2025), tables 3–11 of the DSA Implementing Regulation template
 (`../krMaynard.github.io/data/vlop-dsa.json`).
 
-A query names one of the 9 DSA **report tables** (`GET /tables`) and then
+A query names one of the 9 DSA **report tables** (`GET /api/tables`) and then
 describes filters, group-bys, and aggregates over that table's fields.
 
 ## Demo walkthrough
@@ -56,20 +56,20 @@ service authenticates real Google accounts via **Google Identity Services** — 
 runs over [**FedCM**](https://developers.google.com/identity/gsi/web/guides/fedcm-migration)
 in supporting browsers, with non-FedCM fallback elsewhere:
 
-- The frontend gets a Google **ID token** and POSTs it to `POST /auth/google`; the
+- The frontend gets a Google **ID token** and POSTs it to `POST /api/auth/google`; the
   server verifies it (signature, `aud=GOOGLE_CLIENT_ID`, issuer, expiry, verified email).
 - A new account becomes a **`pending`** registration (`202`); an **admin** (`ADMIN_EMAILS`,
-  implicitly approved) approves it via `POST /admin/registrations/{email}/approve`.
+  implicitly approved) approves it via `POST /api/admin/registrations/{email}/approve`.
 - An approved login mints a first-party **session key** (`gs_…`, TTL
   `GOOGLE_SESSION_TTL_SECONDS`) used as `X-API-Key` like any other.
-- Sessions are **revocable**: `POST /admin/registrations/{email}/revoke` (or
-  `DELETE /portal/key` to sign yourself out) takes effect on the next request, because
+- Sessions are **revocable**: `POST /api/admin/registrations/{email}/revoke` (or
+  `DELETE /api/portal/key` to sign yourself out) takes effect on the next request, because
   Google sessions are re-checked against the registration each call.
 
 ### Demo keys (local dev)
 
 With `ALLOW_DEMO_KEYS=1` (default), the built-in `alice`/`bob` keys and the open,
-no-auth `POST /portal/register` flow (rate-limited per IP/email, keys expiring after
+no-auth `POST /api/portal/register` flow (rate-limited per IP/email, keys expiring after
 `ISSUED_KEY_TTL_SECONDS`) remain available. Set `ALLOW_DEMO_KEYS=0` in production so
 only Google sign-in works.
 
@@ -83,14 +83,14 @@ a boolean `query` of `and` / `or` / `not` clauses, where each clause is a
 
 A query names a `table` (one of the 9 DSA report tables). The server validates
 every field and operation against **that table's** fixed registry
-(`GET /fields?table=…`) and compiles the request into a **single parameterised
+(`GET /api/fields?table=…`) and compiles the request into a **single parameterised
 SELECT** — values are always bound, never interpolated. Unknown fields, bad
 operations, or injection attempts in values are rejected with `400` (or, for
 values, bound harmlessly as data). There is no code path that executes
 caller-authored SQL.
 
 ```jsonc
-// POST /query — "top 5 platforms by Art. 16 notices received" (table t4_notices)
+// POST /api/query — "top 5 platforms by Art. 16 notices received" (table t4_notices)
 {
   "table": "t4_notices",
   "query": {
@@ -109,7 +109,7 @@ caller-authored SQL.
 
 ### Query language
 
-- **`table`** — which DSA report table to query (required). See `GET /tables`.
+- **`table`** — which DSA report table to query (required). See `GET /api/tables`.
 - **`query`** — `{ "and": [...], "or": [...], "not": [...] }`. Each list holds
   conditions; `and` are ANDed, `or` are ORed together, `not` are negated, and
   the three groups are combined with AND. All optional.
@@ -123,7 +123,7 @@ caller-authored SQL.
 - **`sort`** — `[{ "field_name", "order": asc|desc }]` over output columns.
 - **`max_count`** — row cap (default 100, capped at `ROW_LIMIT`).
 
-Call `GET /fields` for the full list of queryable dimensions, measures, and
+Call `GET /api/fields` for the full list of queryable dimensions, measures, and
 operations.
 
 ## Why an async job pattern?
@@ -132,35 +132,35 @@ A query against a large dataset can take seconds or minutes. If the API held
 the HTTP connection open the whole time, slow queries would tie up workers,
 time out at intermediate proxies, and stall the service.
 
-So `POST /query` does **not** return rows. It validates the structured query,
+So `POST /api/query` does **not** return rows. It validates the structured query,
 returns `202 Accepted` plus a `job_id` immediately, runs the compiled query on
-a background worker, and the client polls `/jobs/{job_id}` until it sees
-`status="done"`. Then it fetches `/jobs/{job_id}/result?format=json|csv`.
+a background worker, and the client polls `/api/jobs/{job_id}` until it sees
+`status="done"`. Then it fetches `/api/jobs/{job_id}/result?format=json|csv`.
 
 ```
 client                          server
   │                               │
-  │── POST /query ───────────────▶│   validate + compile, enqueue
+  │── POST /api/query ───────────────▶│   validate + compile, enqueue
   │◀── 202 + {job_id, status_url} │   (invalid query → 400, no job)
   │                               │   ┌─ worker thread
   │                               │   │   open ro conn
-  │── GET /jobs/{id} ────────────▶│   │   execute parameterised SQL
+  │── GET /api/jobs/{id} ────────────▶│   │   execute parameterised SQL
   │◀── {status: running}          │   │   buffer rows
-  │── GET /jobs/{id} ────────────▶│   │
+  │── GET /api/jobs/{id} ────────────▶│   │
   │◀── {status: done, result_url} │◀──┘
-  │── GET /jobs/{id}/result ─────▶│
+  │── GET /api/jobs/{id}/result ─────▶│
   │◀── rows (json or csv)         │
 ```
 
 ### Webhook callbacks (poll *or* get notified)
 
 Polling is the default, but you can also include a `callback_url` in the
-`POST /query` body. When the job reaches a terminal state the server POSTs the
+`POST /api/query` body. When the job reaches a terminal state the server POSTs the
 job object (including signed `download_urls`) to that URL, so you don't have to
 poll:
 
 ```jsonc
-POST /query
+POST /api/query
 { "aggregates": [{"function": "COUNT", "alias": "n"}],
   "callback_url": "https://your-service.example.com/hooks/jobs" }
 
@@ -231,12 +231,12 @@ python demo.py --pause   # press Enter to advance each step (live demo mode)
 export KEY='alice'
 
 # 4. Look around — list report tables and a table's queryable fields
-curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/tables
-curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/schema/t4_notices
-curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/fields?table=t4_notices"
+curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/api/tables
+curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/api/schema/t4_notices
+curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/fields?table=t4_notices"
 
 # 5. Submit a structured query — note the 202 + job_id
-curl -i -X POST http://127.0.0.1:8000/query \
+curl -i -X POST http://127.0.0.1:8000/api/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
   -d '{
         "table": "t4_notices",
@@ -251,47 +251,47 @@ curl -i -X POST http://127.0.0.1:8000/query \
 export JOB='<paste-job_id-here>'
 
 # 6. Poll until done
-curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB"
+curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB"
 
 # 7. Fetch the result as JSON or CSV
-curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB/result?format=json"
-curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB/result?format=csv" -o result.csv
+curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB/result?format=json"
+curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB/result?format=csv" -o result.csv
 ```
 
 ### One-liner (capture id, poll, fetch)
 
 ```bash
 KEY='alice'
-JOB=$(curl -s -X POST http://127.0.0.1:8000/query \
+JOB=$(curl -s -X POST http://127.0.0.1:8000/api/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
   -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"category_code","field_values":["TOTAL"]}]},"group_by":["service_name"],"aggregates":[{"function":"SUM","field_name":"notices","alias":"notices"}],"sort":[{"field_name":"notices","order":"desc"}],"max_count":5}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
-until [ "$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB" | python3 -c "import sys,json;print(json.load(sys.stdin)['status'])")" = "done" ]; do sleep 0.2; done
-curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB/result?format=json"
+until [ "$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB" | python3 -c "import sys,json;print(json.load(sys.stdin)['status'])")" = "done" ]; do sleep 0.2; done
+curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB/result?format=json"
 ```
 
 ### Things to try that demonstrate the design
 
 ```bash
 # No key -> 401
-curl -i http://127.0.0.1:8000/tables
+curl -i http://127.0.0.1:8000/api/tables
 
 # Arbitrary SQL is impossible — there's no `sql` field. An unknown field is
 # rejected synchronously with 400 (the request never becomes a job):
-curl -s -X POST http://127.0.0.1:8000/query \
+curl -s -X POST http://127.0.0.1:8000/api/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
   -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"secrets","field_values":["x"]}]}}'
 # -> 400 {"detail":"Unknown field 'secrets' for this table. ..."}
 
 # A SQL-looking string in field_values is bound as data, not code: the job
 # succeeds and simply matches nothing.
-curl -s -X POST http://127.0.0.1:8000/query \
+curl -s -X POST http://127.0.0.1:8000/api/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
   -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"service_name","field_values":["X%27%3B DROP TABLE services"]}]}}'
-# (then GET /jobs/<id> -> {"status":"done","row_count":0})
+# (then GET /api/jobs/<id> -> {"status":"done","row_count":0})
 
 # Bob cannot see Alice's job
-curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
+curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/api/jobs/$JOB"   # -> 404
 
 # Or just open the Swagger UI in a browser:  http://127.0.0.1:8000/docs
 # (click "Authorize" and paste a key)
@@ -299,40 +299,45 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 
 ## Endpoints
 
+The dashboard is served at `/` and the JSON API lives under `/api/*` on the same
+origin (no CORS). Operational endpoints and pages stay at the root.
+
 | Method | Path                                | Auth | Description                                    |
 |--------|-------------------------------------|------|------------------------------------------------|
-| GET    | `/`                                 | —    | Service info                                   |
-| GET    | `/portal`                           | —    | Researcher portal (web UI)                     |
-| POST   | `/auth/google`                      | —    | Verify a Google ID token → session key, or `202` pending approval |
-| POST   | `/portal/register`                  | —    | Demo: issue a key without auth (disabled when `ALLOW_DEMO_KEYS=0`) |
-| DELETE | `/portal/key`                       | key  | Revoke your own session / portal-issued key    |
-| GET    | `/admin/registrations`              | admin| List researcher registrations (`?status=`)     |
-| POST   | `/admin/registrations/{email}/approve` | admin | Approve an account                         |
-| POST   | `/admin/registrations/{email}/revoke`  | admin | Revoke an account (kills live sessions)    |
+| GET    | `/`                                 | —    | Public VLOP transparency **dashboard** (web UI) |
+| GET    | `/api/overview`                     | —    | Public headline aggregates powering the dashboard |
+| GET    | `/api`                              | —    | API service info                               |
+| GET    | `/portal`                           | —    | Researcher portal (web UI)                      |
+| POST   | `/api/auth/google`                  | —    | Verify a Google ID token → session key, or `202` pending approval |
+| POST   | `/api/portal/register`              | —    | Demo: issue a key without auth (disabled when `ALLOW_DEMO_KEYS=0`) |
+| DELETE | `/api/portal/key`                   | key  | Revoke your own session / portal-issued key    |
+| GET    | `/api/admin/registrations`          | admin| List researcher registrations (`?status=`)     |
+| POST   | `/api/admin/registrations/{email}/approve` | admin | Approve an account                  |
+| POST   | `/api/admin/registrations/{email}/revoke`  | admin | Revoke an account (kills live sessions) |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
 | GET    | `/version`                          | —    | Deployed build (commit SHA); also `X-Version` header |
 | GET    | `/metrics`                          | —    | Prometheus metrics (scrape over internal net)  |
-| GET    | `/tables`                           | key  | List the DSA report tables + dataset period    |
-| GET    | `/fields?table=…`                   | key  | A table's queryable fields and operations      |
-| GET    | `/schema/{table}`                   | key  | A report table's field registry                |
-| POST   | `/query`                            | key  | Submit a structured query over a `table` (optional `callback_url`) — returns `202 + job_id` |
-| GET    | `/jobs`                             | key  | List **your** jobs                             |
-| GET    | `/jobs/{job_id}`                    | key  | Job status (your jobs only)                    |
-| GET    | `/jobs/{job_id}/result?format=…`    | key  | Result rows (only when `status=done`)          |
-| GET    | `/jobs/{job_id}/download?…`          | —    | Secure result download via a signed, expiring URL |
-| DELETE | `/jobs/{job_id}`                    | key  | Cancel a running job, or remove a finished one |
+| GET    | `/api/tables`                       | key  | List the DSA report tables + dataset period    |
+| GET    | `/api/fields?table=…`               | key  | A table's queryable fields and operations      |
+| GET    | `/api/schema/{table}`               | key  | A report table's field registry                |
+| POST   | `/api/query`                        | key  | Submit a structured query over a `table` (optional `callback_url`) — returns `202 + job_id` |
+| GET    | `/api/jobs`                         | key  | List **your** jobs                             |
+| GET    | `/api/jobs/{job_id}`                | key  | Job status (your jobs only)                    |
+| GET    | `/api/jobs/{job_id}/result?format=…`| key  | Result rows (only when `status=done`)          |
+| GET    | `/api/jobs/{job_id}/download?…`      | —    | Secure result download via a signed, expiring URL |
+| DELETE | `/api/jobs/{job_id}`                | key  | Cancel a running job, or remove a finished one |
 
 ## Job statuses
 
 - `queued` — accepted, waiting for a worker
 - `running` — a worker is executing the compiled query
-- `done` — finished successfully; result available at `/jobs/{id}/result`
+- `done` — finished successfully; result available at `/api/jobs/{id}/result`
 - `failed` — row-limit or runtime error; see `error` field
-- `cancelled` — client called `DELETE /jobs/{id}` before completion
+- `cancelled` — client called `DELETE /api/jobs/{id}` before completion
 
 Invalid queries (unknown fields, illegal operations, bad aliases) are rejected
-synchronously with `400` at `POST /query` and never become jobs.
+synchronously with `400` at `POST /api/query` and never become jobs.
 
 `DELETE` while running calls SQLite's `interrupt()` to abort the in-flight
 query, then drops the job from the registry.
@@ -345,17 +350,17 @@ map with a signed, expiring link for each format:
 ```jsonc
 {
   "status": "done",
-  "result_url": "/jobs/<id>/result",
+  "result_url": "/api/jobs/<id>/result",
   "download_urls": {
-    "json": "/jobs/<id>/download?format=json&expires=1780767547&sig=ff9e1b…",
-    "csv":  "/jobs/<id>/download?format=csv&expires=1780767547&sig=3f1e4e…"
+    "json": "/api/jobs/<id>/download?format=json&expires=1780767547&sig=ff9e1b…",
+    "csv":  "/api/jobs/<id>/download?format=csv&expires=1780767547&sig=3f1e4e…"
   }
 }
 ```
 
 These are **capability URLs** (like an S3 presigned link): the `sig` is an
 HMAC-SHA256 over the job id, format, and expiry, so the link authorises that
-exact download and nothing else. `GET /jobs/{id}/download` therefore needs
+exact download and nothing else. `GET /api/jobs/{id}/download` therefore needs
 **no `X-API-Key`** — possession of a valid, unexpired URL is sufficient — and
 serves the result as a file attachment. You can hand the URL to a browser, a
 `curl` without headers, or a download manager. The signature is checked before
@@ -364,7 +369,7 @@ job id exists (no existence probing).
 
 ```bash
 # Fetch the signed CSV link from the job status, then download with no key:
-URL=$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB" \
+URL=$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/api/jobs/$JOB" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['download_urls']['csv'])")
 curl -OJ "http://127.0.0.1:8000$URL"     # writes <job_id>.csv
 ```
@@ -398,7 +403,7 @@ parent company), `categories(id, code, label)`, `sections`, `indicators`,
 | `t11_qualitative` | Qualitative descriptions | indicator → `qualitative_text` (free text, no measures) |
 
 Every table also has the `service_name` and `platform` dimensions. Run
-`GET /tables`, then `GET /schema/{table}` for a table's exact dimension/measure
+`GET /api/tables`, then `GET /api/schema/{table}` for a table's exact dimension/measure
 fields and a runnable example.
 
 ## Sample queries
@@ -440,7 +445,7 @@ fields and a runnable example.
 
 ## Rate limiting & logging
 
-`POST /query` spawns background work, so it's throttled per API key — by default
+`POST /api/query` spawns background work, so it's throttled per API key — by default
 60 submissions per 60 s (`QUERY_RATE_MAX_PER_WINDOW` / `QUERY_RATE_WINDOW_SECONDS`).
 Over the limit returns `429` with a `Retry-After` header, before any job is
 created. The counter shares the Redis-backed (or in-memory) store used for portal
@@ -467,7 +472,7 @@ ids never explode label cardinality:
 - `api_demo_jobs_total{status}` (`done` / `failed`)
 
 ```
-api_demo_http_requests_total{method="GET",path="/jobs/{job_id}",status="200"} 1.0
+api_demo_http_requests_total{method="GET",path="/api/jobs/{job_id}",status="200"} 1.0
 api_demo_jobs_total{status="done"} 1.0
 ```
 
@@ -487,7 +492,7 @@ All tuneable values are read from environment variables at startup:
 | `GOOGLE_CLIENT_ID` | _(unset — sign-in disabled)_ | OAuth 2.0 Web client ID; the `aud` Google ID tokens are verified against |
 | `ADMIN_EMAILS` | _(empty)_ | Comma-separated admin allowlist — implicitly approved, can approve/revoke others |
 | `GOOGLE_SESSION_TTL_SECONDS` | `604800` | Lifetime of a first-party session minted after Google sign-in (7 days) |
-| `ALLOW_DEMO_KEYS` | `1` | Demo `alice`/`bob` keys + open `/portal/register`; set `0` in production |
+| `ALLOW_DEMO_KEYS` | `1` | Demo `alice`/`bob` keys + open `/api/portal/register`; set `0` in production |
 | `ALLOWED_ORIGINS` | _(empty — same-origin only)_ | Comma-separated browser origins allowed for cross-origin API calls (CORS) |
 | `DOWNLOAD_URL_SECRET` | _(random per process)_ | HMAC secret for signing download URLs — set a stable value in production |
 | `DOWNLOAD_URL_TTL_SECONDS` | `3600` | How long a signed download URL stays valid |
@@ -495,7 +500,7 @@ All tuneable values are read from environment variables at startup:
 | `PORTAL_REGISTER_MAX_PER_WINDOW` | `10` | Max registrations per IP/email per window |
 | `PORTAL_REGISTER_WINDOW_SECONDS` | `3600` | Registration rate-limit window |
 | `TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` for the client IP (set only behind a trusted proxy) |
-| `QUERY_RATE_MAX_PER_WINDOW` | `60` | Max `POST /query` submissions per API key per window |
+| `QUERY_RATE_MAX_PER_WINDOW` | `60` | Max `POST /api/query` submissions per API key per window |
 | `QUERY_RATE_WINDOW_SECONDS` | `60` | Query rate-limit window |
 | `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
 | `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |

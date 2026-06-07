@@ -166,10 +166,10 @@ function renderTable(t) {
 }
 
 async function loadSchema() {
-  const meta = await api("/tables", apiKey);
+  const meta = await api("/api/tables", apiKey);
   $("#dataset-meta").textContent = `${meta.dataset} · period ${meta.period} · ${meta.tables.length} report tables`;
   // Fetch every table's field registry in parallel rather than one roundtrip at a time.
-  const details = await Promise.all(meta.tables.map((t) => api(`/schema/${t.name}`, apiKey)));
+  const details = await Promise.all(meta.tables.map((t) => api(`/api/schema/${t.name}`, apiKey)));
   $("#tables").innerHTML = details.map(renderTable).join("");
   show($("#schema-card"));
 }
@@ -196,7 +196,7 @@ async function onAuthSuccess(data) {
 async function onGoogleCredential(resp) {
   $("#error").textContent = "";
   try {
-    const r = await fetch("/auth/google", {
+    const r = await fetch("/api/auth/google", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ credential: resp.credential }),
@@ -246,7 +246,7 @@ $("#login-form").addEventListener("submit", async (e) => {
   const btn = $("#submit");
   btn.disabled = true; btn.textContent = "Issuing key…";
   try {
-    const res = await fetch("/portal/register", {
+    const res = await fetch("/api/portal/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, email }),
@@ -264,7 +264,7 @@ $("#login-form").addEventListener("submit", async (e) => {
 // Decide which sign-in methods to offer based on server config.
 async function init() {
   let cfg = {};
-  try { cfg = (await (await fetch("/")).json()).auth_config || {}; } catch (_) {}
+  try { cfg = (await (await fetch("/api")).json()).auth_config || {}; } catch (_) {}
   const googleOn = !!(cfg.google_signin && cfg.google_client_id);
   const demoOn = !!cfg.demo_keys;
 
