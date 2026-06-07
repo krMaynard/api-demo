@@ -15,6 +15,6 @@ if [[ ! -f "$src" ]]; then
   exit 1
 fi
 
-python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$src"  # validate JSON
+python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$src"  # validate JSON
 cp "$src" "$dst"
 echo "Updated $dst from $src ($(wc -c <"$dst") bytes)."

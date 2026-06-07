@@ -25,7 +25,9 @@ COPY data/ ./data/
 # Build the read-only SQLite DB into the image.
 RUN python seed.py --source data/vlop-dsa.json --db "$DB_PATH"
 
-# Run as a non-root user (the seeded DB is world-readable from the build above).
+# Run as a non-root user. The DB is opened mode=ro and the app writes nothing
+# under /app, so we deliberately leave /app root-owned and only world-readable —
+# the runtime user can read the seeded DB but cannot modify it (defence in depth).
 RUN useradd --system --uid 10001 appuser
 USER appuser
 

@@ -119,9 +119,16 @@ path, status, `duration_ms`, and a `request_id` (also returned as the
 
 ### Priority 2 — Once you have users
 
-#### Enable SQLite WAL mode
+#### Enable SQLite WAL mode (writable-DB deployments only)
 
-Allows multiple uvicorn workers to read simultaneously without blocking:
+The connection is opened `mode=ro`, and the Cloud Run image bakes the DB in as
+a read-only, root-owned file (so a compromised app can't modify it). Concurrent
+**reads** already work fine in that setup — WAL is not needed and would not apply,
+since `mode=ro` never creates `-wal`/`-shm` files.
+
+WAL is only relevant if you switch to a **writable** database (e.g. a mounted
+volume rather than the baked image). In that case set it once after seeding, and
+make the DB directory writable by the runtime user:
 
 ```bash
 # Run once after seeding, before starting the service
