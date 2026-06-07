@@ -311,6 +311,7 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | POST   | `/admin/registrations/{email}/revoke`  | admin | Revoke an account (kills live sessions)    |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
+| GET    | `/version`                          | —    | Deployed build (commit SHA); also `X-Version` header |
 | GET    | `/metrics`                          | —    | Prometheus metrics (scrape over internal net)  |
 | GET    | `/tables`                           | key  | List the DSA report tables + dataset period    |
 | GET    | `/fields?table=…`                   | key  | A table's queryable fields and operations      |
@@ -598,6 +599,13 @@ Then add these under **Settings → Secrets and variables → Actions → Variab
 
 Do the **first** deploy with `service.yaml` (it sets env/secrets/scaling); the
 Action thereafter just ships new image revisions, preserving that config.
+
+Each run deploys the new revision with **no traffic**, **smoke-tests** its
+`/readyz` on the revision's own URL, and only then **routes traffic** to it — so
+a revision that fails to come up never receives requests. It also stamps the
+commit SHA as `APP_VERSION`, surfaced at `GET /version` and the `X-Version`
+header (the smoke test assumes a public service; for an IAM-gated one, add an
+identity-token header).
 
 ### Custom domain
 

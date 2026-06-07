@@ -900,3 +900,20 @@ class TestCORS:
         import main
         monkeypatch.setenv("ALLOWED_ORIGINS", " https://a.example , https://b.example ,")
         assert main._cors_origins() == ["https://a.example", "https://b.example"]
+
+
+# ── Version / build identifier ───────────────────────────────────────────────
+
+class TestVersion:
+    def test_version_endpoint(self):
+        r = client.get("/version")
+        assert r.status_code == 200
+        body = r.json()
+        # Defaults to "dev" in tests (APP_VERSION unset); the CD workflow injects
+        # the commit SHA on Cloud Run.
+        assert body["version"] == "dev"
+        assert "app_version" in body
+
+    def test_x_version_header_on_every_response(self):
+        r = client.get("/healthz")
+        assert r.headers.get("X-Version") == "dev"

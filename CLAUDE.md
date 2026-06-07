@@ -51,7 +51,9 @@ Keep both green — the suite is hermetic (no Redis/server/`demo.db` needed;
 `conftest.py` builds a temp DB). Run them locally before pushing.
 
 `deploy.yml` builds + pushes the image and rolls a Cloud Run revision on push to
-`main` via Workload Identity Federation. It's gated on the `GCP_PROJECT_ID` repo
+`main` via Workload Identity Federation, stamping the commit SHA as `APP_VERSION`.
+It deploys with `--no-traffic`, smoke-tests the new revision's `/readyz`, then
+promotes it with `update-traffic --to-latest`. Gated on the `GCP_PROJECT_ID` repo
 variable, so it **skips** (not fails) until GCP is configured — see README →
 "Continuous deployment". `.gcloudignore` keeps the Cloud Build upload lean.
 
@@ -232,3 +234,4 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 | GET | `/jobs/{id}/download?format=…&expires=…&sig=…` | signed URL | Secure download, no key needed |
 | DELETE | `/jobs/{id}` | key | Cancel or remove |
 | GET | `/metrics` | — | Prometheus metrics |
+| GET | `/version` | — | Deployed build (commit SHA via `APP_VERSION`); also the `X-Version` header |

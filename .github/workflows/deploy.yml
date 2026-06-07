@@ -47,13 +47,37 @@ jobs:
           gcloud builds submit --quiet --tag "${IMAGE}:${GITHUB_SHA}" .
           gcloud artifacts docker tags add "${IMAGE}:${GITHUB_SHA}" "${IMAGE}:latest" --quiet
 
-      - name: Deploy to Cloud Run
-        # Rolls a new revision with this image, preserving the service's existing
-        # env/secrets/scaling (set once via service.yaml). Set the DEPLOY repo
-        # variable to "false" to build & push only, without deploying.
+      - name: Deploy new revision (no traffic)
+        # Roll a new revision but hold traffic on the current one, so we can probe
+        # the new revision before promoting it. Preserves the service's existing
+        # env/secrets/scaling (set once via service.yaml) and stamps APP_VERSION
+        # with the commit SHA (surfaced at /version + the X-Version header).
+        # Set the DEPLOY repo variable to "false" to build & push only.
         if: ${{ vars.DEPLOY != 'false' }}
         run: |
           gcloud run deploy "${SERVICE}" \
             --image "${IMAGE}:${GITHUB_SHA}" \
-            --region "${REGION}" \
-            --quiet
+            --region "${REGION}" --project "${PROJECT_ID}" \
+            --update-env-vars "APP_VERSION=${GITHUB_SHA}" \
+            --tag candidate --no-traffic --quiet
+
+      - name: Smoke-test the new revision
+        # Probe the candidate revision's own URL (0% production traffic yet). If
+        # /readyz doesn't come up, the job fails here and traffic is never moved.
+        # Assumes a public service (README default); for an IAM-gated service add
+        # an identity-token Authorization header.
+        if: ${{ vars.DEPLOY != 'false' }}
+        run: |
+          URL=$(gcloud run services describe "${SERVICE}" \
+            --region "${REGION}" --project "${PROJECT_ID}" \
+            --flatten="status.traffic[]" --filter="status.traffic.tag=candidate" \
+            --format="value(status.traffic.url)")
+          echo "Probing ${URL}/readyz"
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 3 "${URL}/readyz"
+
+      - name: Route traffic to the new revision
+        if: ${{ vars.DEPLOY != 'false' }}
+        run: |
+          gcloud run services update-traffic "${SERVICE}" \
+            --region "${REGION}" --project "${PROJECT_ID}" \
+            --to-latest --quiet

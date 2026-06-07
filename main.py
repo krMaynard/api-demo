@@ -101,6 +101,10 @@ GOOGLE_SESSION_TTL = int(os.getenv("GOOGLE_SESSION_TTL_SECONDS", str(7 * 24 * 36
 # Demo auth (hardcoded alice/bob keys + the open /portal/register flow). Handy for
 # local dev; set ALLOW_DEMO_KEYS=0 in production so only Google sign-in works.
 ALLOW_DEMO_KEYS = os.getenv("ALLOW_DEMO_KEYS", "1").lower() in ("1", "true", "yes")
+# Deployed build identifier — the CD workflow injects the commit SHA as APP_VERSION
+# on each Cloud Run revision; defaults to "dev" locally. Surfaced at GET /version
+# and in the X-Version response header so you can confirm what's actually live.
+APP_VERSION = os.getenv("APP_VERSION", "dev")
 # Only honour X-Forwarded-For for the client IP when behind a trusted proxy that
 # overwrites it. Off by default: trusting it unconditionally would let any client
 # spoof the header to dodge the registration rate limit.
@@ -751,6 +755,7 @@ async def log_requests(request: Request, call_next):
         }},
     )
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Version"] = APP_VERSION
     return response
 
 
@@ -1297,6 +1302,7 @@ def root() -> dict[str, Any]:
             "GET /schema/{table}": "Field registry for a report table",
             "GET /healthz": "Liveness probe",
             "GET /readyz": "Readiness probe (checks DB connection)",
+            "GET /version": "Deployed build identifier (commit SHA)",
             "GET /metrics": "Prometheus metrics (no auth)",
             "GET /docs": "Interactive Swagger UI",
         },
@@ -1529,6 +1535,12 @@ def revoke_registration(email: str, admin: dict = Depends(require_admin)) -> dic
 @app.get("/healthz")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/version")
+def version() -> dict[str, str]:
+    """The deployed build (commit SHA on Cloud Run, else "dev") + app version."""
+    return {"version": APP_VERSION, "app_version": app.version}
 
 
 @app.get("/metrics")
