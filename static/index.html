@@ -96,11 +96,6 @@ function stat(num, lbl) {
   return `<div class="stat"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
 }
 
-async function whenChartReady() {
-  for (let i = 0; i < 100 && !window.Chart; i++) await new Promise(r => setTimeout(r, 50));
-  return !!window.Chart;
-}
-
 function barChart(canvasId, labels, data, label) {
   new Chart($(canvasId), {
     type: "bar",
@@ -133,14 +128,13 @@ async function load() {
     stat(fmt(d.platforms), "Parent platforms") +
     stat(fmt(d.total_notices), "Art. 16 notices");
 
-  if (await whenChartReady()) {
-    const tp = d.top_platforms || [];
-    barChart("#chart-platforms", tp.map(x => x.platform), tp.map(x => x.notices), "Notices");
-    const bc = d.by_category || [];
-    barChart("#chart-categories", bc.map(x => x.category), bc.map(x => x.notices), "Notices");
-  }
+  // Chart.js is loaded with `defer`, so it's guaranteed ready by DOMContentLoaded.
+  const tp = d.top_platforms || [];
+  barChart("#chart-platforms", tp.map(x => x.platform), tp.map(x => x.notices), "Notices");
+  const bc = d.by_category || [];
+  barChart("#chart-categories", bc.map(x => x.category), bc.map(x => x.notices), "Notices");
 }
-load();
+document.addEventListener("DOMContentLoaded", load);
 </script>
 </body>
 </html>

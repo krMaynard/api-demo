@@ -1404,10 +1404,14 @@ def portal_page() -> FileResponse:
     return FileResponse(path, media_type="text/html")
 
 
-@api_router.get("/overview")
-def overview() -> dict[str, Any]:
-    """Public headline aggregates for the dashboard — no auth. Computed live from
-    the read-only DB with cheap fixed queries (no user input reaches SQL)."""
+# The dashboard aggregates never change at runtime (the DB is opened mode=ro and
+# baked into the image), so compute them once and memoise — this public endpoint
+# then serves from memory instead of re-querying on every hit.
+_overview_cache: dict[str, Any] | None = None
+_overview_cache_lock = threading.Lock()
+
+
+def _compute_overview() -> dict[str, Any]:
     conn = _connect_ro()
     try:
         meta = _dataset_meta()
@@ -1441,6 +1445,19 @@ def overview() -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+@api_router.get("/overview")
+def overview() -> dict[str, Any]:
+    """Public headline aggregates for the dashboard — no auth. Memoised: the
+    read-only DB is static, so we compute the fixed queries once (no user input
+    reaches SQL) and serve from memory thereafter."""
+    global _overview_cache
+    if _overview_cache is None:
+        with _overview_cache_lock:
+            if _overview_cache is None:
+                _overview_cache = _compute_overview()
+    return _overview_cache
 
 
 @api_router.post("/portal/register", status_code=201)
