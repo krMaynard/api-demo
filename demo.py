@@ -121,7 +121,7 @@ def _check_server() -> None:
         print(f"  {GREEN}Server is running at {BASE}{RESET}\n")
     except Exception:
         print(f"  {RED}Cannot reach {BASE}{RESET}")
-        print(f"  Start it first:  uvicorn main:app --port 8000")
+        print("  Start it first:  uvicorn main:app --port 8000")
         sys.exit(1)
 
 

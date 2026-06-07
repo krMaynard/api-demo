@@ -32,6 +32,14 @@ Built to demonstrate two things:
 | `scripts/make_portal_gifs.py` | Portal-workflow GIF generator (Playwright + Pillow) → `docs/gifs/portal-*.gif` |
 | `requirements.txt` | `fastapi` + `uvicorn[standard]` |
 | `demo.db` | SQLite DB (git-ignored, produced by `seed.py`) |
+| `.github/workflows/ci.yml` | CI: `pyflakes` lint + `pytest` on every PR/push (Python 3.11 & 3.12) |
+
+## CI
+
+GitHub Actions runs `pyflakes main.py seed.py demo.py conftest.py test_api.py`
+and `pytest test_api.py` on every pull request and push to `main`. Keep both
+green — the suite is hermetic (no Redis/server/`demo.db` needed; `conftest.py`
+builds a temp DB). Run them locally before pushing.
 
 ## Setup
 

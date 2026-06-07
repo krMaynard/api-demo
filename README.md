@@ -1,5 +1,7 @@
 # api-demo
 
+[![CI](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml)
+
 A small FastAPI service that lets a researcher describe a query with
 **structured parameters** (no SQL), runs it asynchronously on a worker thread,
 and serves the results back as JSON or CSV. Backed by a read-only SQLite
@@ -493,6 +495,9 @@ pytest test_api.py -v
 
 No running server or Redis needed — the test suite uses FastAPI's in-process
 `TestClient` and a temporary SQLite database created in `conftest.py`.
+
+The same `pyflakes` lint + `pytest` run on every pull request and push to `main`
+via [GitHub Actions](.github/workflows/ci.yml) (Python 3.11 and 3.12).
 
 ## Regenerating the showcase GIFs
 

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        # Runtime deps + the lint/test tools only — the GIF tooling (playwright,
+        # Pillow, pyte) isn't needed to run the suite, so we skip it to keep CI fast.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx pyflakes
+
+      - name: Lint (pyflakes)
+        run: python -m pyflakes main.py seed.py demo.py conftest.py test_api.py
+
+      - name: Run tests
+        run: python -m pytest test_api.py -q
