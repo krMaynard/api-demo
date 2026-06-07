@@ -2,11 +2,16 @@
 
 [![CI](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml)
 
-A small FastAPI service that lets a researcher describe a query with
-**structured parameters** (no SQL), runs it asynchronously on a worker thread,
-and serves the results back as JSON or CSV. Backed by a read-only SQLite
-database seeded from the **Google Government Content Removals** dataset
-(`../krMaynard.github.io/data/google-government-removals.json`).
+A FastAPI service that lets a researcher describe a query with **structured
+parameters** (no SQL), runs it asynchronously on a worker thread, and serves the
+results back as JSON or CSV. Backed by a read-only SQLite database seeded from the
+aggregated **EU Digital Services Act (DSA) VLOP transparency reports** —
+content-moderation statistics for 33 designated Very Large Online Platforms /
+Search Engines (H2 2025), tables 3–11 of the DSA Implementing Regulation template
+(`../krMaynard.github.io/data/vlop-dsa.json`).
+
+A query names one of the 9 DSA **report tables** (`GET /tables`) and then
+describes filters, group-bys, and aggregates over that table's fields.
 
 ## Demo walkthrough
 
@@ -23,7 +28,7 @@ result, secure download, validation, and isolation:
 | **Fetch the result (JSON)** | **Secure download — signed URL, no API key** |
 | ![Result](docs/gifs/step-07-fetch-the-result-as-json.gif) | ![Download](docs/gifs/step-08-secure-download-signed-url-no-api-key.gif) |
 | **Discover queryable fields** | **Invalid query → 400 (no arbitrary SQL)** |
-| ![Fields](docs/gifs/step-04-discover-the-queryable-fields-get-fields.gif) | ![Invalid](docs/gifs/step-10-invalid-query-400-no-sql-no-unknown-fiel.gif) |
+| ![Fields](docs/gifs/step-04-discover-a-table-s-fields-get-fields-tab.gif) | ![Invalid](docs/gifs/step-10-invalid-query-400-no-sql-no-unknown-fiel.gif) |
 
 A GIF for every step lives in [`docs/gifs/`](docs/gifs/). They're generated
 headlessly from `demo.py` — see [Regenerating the showcase GIFs](#regenerating-the-showcase-gifs).
@@ -62,33 +67,35 @@ a boolean `query` of `and` / `or` / `not` clauses, where each clause is a
 `{operation, field_name, field_values}` condition, plus optional `group_by`,
 `aggregates`, `sort`, and `max_count`.
 
-The server validates every field and operation against a fixed registry
-(`GET /fields`) and compiles the request into a **single parameterised
+A query names a `table` (one of the 9 DSA report tables). The server validates
+every field and operation against **that table's** fixed registry
+(`GET /fields?table=…`) and compiles the request into a **single parameterised
 SELECT** — values are always bound, never interpolated. Unknown fields, bad
 operations, or injection attempts in values are rejected with `400` (or, for
 values, bound harmlessly as data). There is no code path that executes
 caller-authored SQL.
 
 ```jsonc
-// POST /query — "top 5 EU countries by items requested for removal"
+// POST /query — "top 5 platforms by Art. 16 notices received" (table t4_notices)
 {
+  "table": "t4_notices",
   "query": {
     "and": [
-      { "operation": "IN", "field_name": "country_code",
-        "field_values": ["DE", "FR", "IT", "ES", "NL"] }
+      { "operation": "EQ", "field_name": "category_code", "field_values": ["TOTAL"] }
     ]
   },
-  "group_by": ["country_name"],
+  "group_by": ["service_name"],
   "aggregates": [
-    { "function": "SUM", "field_name": "items_requested", "alias": "items" }
+    { "function": "SUM", "field_name": "notices", "alias": "notices" }
   ],
-  "sort": [{ "field_name": "items", "order": "desc" }],
+  "sort": [{ "field_name": "notices", "order": "desc" }],
   "max_count": 5
 }
 ```
 
 ### Query language
 
+- **`table`** — which DSA report table to query (required). See `GET /tables`.
 - **`query`** — `{ "and": [...], "or": [...], "not": [...] }`. Each list holds
   conditions; `and` are ANDed, `or` are ORed together, `not` are negated, and
   the three groups are combined with AND. All optional.
@@ -96,7 +103,7 @@ caller-authored SQL.
   - Operations: `EQ`, `IN` (all fields); `GT`, `GTE`, `LT`, `LTE` (numeric
     measures only). `field_values` is always a list.
 - **`fields`** — columns to return for a raw (non-aggregated) query. Defaults
-  to every field. Cannot be combined with `group_by`/`aggregates`.
+  to every field of the table. Cannot be combined with `group_by`/`aggregates`.
 - **`group_by`** — dimension fields to group on.
 - **`aggregates`** — `{ "function": SUM|COUNT|AVG|MIN|MAX, "field_name", "alias" }`.
 - **`sort`** — `[{ "field_name", "order": asc|desc }]` over output columns.
@@ -181,10 +188,10 @@ cd api-demo
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# seed.py reads from the sibling krMaynard.github.io repo by default;
+# seed.py reads ../krMaynard.github.io/data/vlop-dsa.json by default;
 # override with --source if the JSON lives elsewhere
 python seed.py
-# python seed.py --source /path/to/google-government-removals.json --db demo.db
+# python seed.py --source /path/to/vlop-dsa.json --db demo.db
 
 # 2. Run the server in one terminal (leave it running)
 uvicorn main:app --port 8000
@@ -209,18 +216,20 @@ python demo.py --pause   # press Enter to advance each step (live demo mode)
 # 3. Set your key once so you don't have to repeat it
 export KEY='alice'
 
-# 4. Look around — list tables, columns, and queryable fields
+# 4. Look around — list report tables and a table's queryable fields
 curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/tables
-curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/schema/removals
-curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/fields
+curl -H "X-API-Key: $KEY" http://127.0.0.1:8000/schema/t4_notices
+curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/fields?table=t4_notices"
 
 # 5. Submit a structured query — note the 202 + job_id
 curl -i -X POST http://127.0.0.1:8000/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
   -d '{
-        "group_by": ["country_name"],
-        "aggregates": [{"function":"SUM","field_name":"items_requested","alias":"items"}],
-        "sort": [{"field_name":"items","order":"desc"}],
+        "table": "t4_notices",
+        "query": {"and": [{"operation":"EQ","field_name":"category_code","field_values":["TOTAL"]}]},
+        "group_by": ["service_name"],
+        "aggregates": [{"function":"SUM","field_name":"notices","alias":"notices"}],
+        "sort": [{"field_name":"notices","order":"desc"}],
         "max_count": 5
       }'
 
@@ -241,7 +250,7 @@ curl -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB/result?format=csv" -o
 KEY='alice'
 JOB=$(curl -s -X POST http://127.0.0.1:8000/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"group_by":["country_name"],"aggregates":[{"function":"SUM","field_name":"items_requested","alias":"items"}],"sort":[{"field_name":"items","order":"desc"}],"max_count":5}' \
+  -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"category_code","field_values":["TOTAL"]}]},"group_by":["service_name"],"aggregates":[{"function":"SUM","field_name":"notices","alias":"notices"}],"sort":[{"field_name":"notices","order":"desc"}],"max_count":5}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
 until [ "$(curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB" | python3 -c "import sys,json;print(json.load(sys.stdin)['status'])")" = "done" ]; do sleep 0.2; done
 curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8000/jobs/$JOB/result?format=json"
@@ -257,14 +266,14 @@ curl -i http://127.0.0.1:8000/tables
 # rejected synchronously with 400 (the request never becomes a job):
 curl -s -X POST http://127.0.0.1:8000/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"query":{"and":[{"operation":"EQ","field_name":"secrets","field_values":["x"]}]}}'
-# -> 400 {"detail":"Unknown field 'secrets'. See GET /fields."}
+  -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"secrets","field_values":["x"]}]}}'
+# -> 400 {"detail":"Unknown field 'secrets' for this table. ..."}
 
 # A SQL-looking string in field_values is bound as data, not code: the job
 # succeeds and simply matches nothing.
 curl -s -X POST http://127.0.0.1:8000/query \
   -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"query":{"and":[{"operation":"EQ","field_name":"country_code","field_values":["US%27%3B DROP TABLE countries"]}]}}'
+  -d '{"table":"t4_notices","query":{"and":[{"operation":"EQ","field_name":"service_name","field_values":["X%27%3B DROP TABLE services"]}]}}'
 # (then GET /jobs/<id> -> {"status":"done","row_count":0})
 
 # Bob cannot see Alice's job
@@ -285,10 +294,10 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
 | GET    | `/metrics`                          | —    | Prometheus metrics (scrape over internal net)  |
-| GET    | `/fields`                           | key  | List queryable fields and operations           |
-| GET    | `/tables`                           | key  | List tables                                    |
-| GET    | `/schema/{table}`                   | key  | Show a table's columns                         |
-| POST   | `/query`                            | key  | Submit a structured query (optional `callback_url`) — returns `202 + job_id` |
+| GET    | `/tables`                           | key  | List the DSA report tables + dataset period    |
+| GET    | `/fields?table=…`                   | key  | A table's queryable fields and operations      |
+| GET    | `/schema/{table}`                   | key  | A report table's field registry                |
+| POST   | `/query`                            | key  | Submit a structured query over a `table` (optional `callback_url`) — returns `202 + job_id` |
 | GET    | `/jobs`                             | key  | List **your** jobs                             |
 | GET    | `/jobs/{job_id}`                    | key  | Job status (your jobs only)                    |
 | GET    | `/jobs/{job_id}/result?format=…`    | key  | Result rows (only when `status=done`)          |
@@ -350,53 +359,63 @@ auth) remains available for clients that prefer header auth.
 > zero-config default is a random per-process key, so signed links would
 > otherwise break on restart and wouldn't validate across multiple workers.
 
-## Schema (Google Government Content Removals)
+## Schema (EU DSA VLOP transparency reports)
 
-Star schema — one fact table plus five small dimension tables:
+Star schema — shared dimension tables plus one fact table per DSA report table
+(H2 2025, 33 services). Dimensions: `services(id, name, platform)` (platform =
+parent company), `categories(id, code, label)`, `sections`, `indicators`,
+`scopes`, `surfaces`. Report tables (queried via `table`):
 
-- `removals(period_id, country_id, requestor_id, product_id, reason_id, num_requests, items_requested, removed_legal, removed_policy, not_found, not_enough_info, no_action, already_removed)`
-- `periods(id, label)` — e.g. "January - June 2024"
-- `countries(id, code, name)` — ISO code + display name
-- `requestors(id, name)` — Court Order, Police, Government Officials, …
-- `products(id, name)` — YouTube, Web Search, Maps, …
-- `reasons(id, name)` — Defamation, National security, Privacy, …
+| `table` | DSA report | Key fields |
+|---------|-----------|-----------|
+| `t3_member_state_orders` | Member-State orders (Art. 9 & 10) | category, scope → `orders_to_act`, `items`, `orders_to_provide_info` |
+| `t4_notices` | Notices (Art. 16) | category → `notices`, `tf_notices`, `actions_law`, `actions_tos`, … |
+| `t5_own_initiative_illegal` | Own-initiative (illegal) | category → `measures`, `automated`, `vis_*`, `monetary_*`, `account_*` |
+| `t6_own_initiative_tos` | Own-initiative (ToS) | as t5, plus `surface` |
+| `t7_appeals_recidivism` | Appeals & recidivism | section, indicator, scope, surface → `value` |
+| `t8_automated_means` | Automated means | section, indicator, scope, surface → `value` |
+| `t9_human_resources` | Human resources | section, indicator, scope → `value` |
+| `t10_amar` | Avg Monthly Active Recipients | scope → `value` |
+| `t11_qualitative` | Qualitative descriptions | indicator → `qualitative_text` (free text, no measures) |
 
-### Queryable fields
-
-- **Dimensions** (text; `EQ`/`IN`; usable in `query`, `fields`, `group_by`,
-  `sort`): `period_label`, `country_code`, `country_name`, `requestor_name`,
-  `product_name`, `reason_name`.
-- **Measures** (numeric; `EQ`/`IN`/`GT`/`GTE`/`LT`/`LTE`; usable in `query`,
-  `fields`, `aggregates`): `num_requests`, `items_requested`, `removed_legal`,
-  `removed_policy`, `not_found`, `not_enough_info`, `no_action`,
-  `already_removed`.
+Every table also has the `service_name` and `platform` dimensions. Run
+`GET /tables`, then `GET /schema/{table}` for a table's exact dimension/measure
+fields and a runnable example.
 
 ## Sample queries
 
 ```jsonc
-// Top 10 countries by items requested for removal
+// Top 10 platforms by total Art. 16 notices received
 {
-  "group_by": ["country_name"],
-  "aggregates": [{"function":"SUM","field_name":"items_requested","alias":"items"}],
-  "sort": [{"field_name":"items","order":"desc"}],
+  "table": "t4_notices",
+  "query": {"and": [{"operation":"EQ","field_name":"category_code","field_values":["TOTAL"]}]},
+  "group_by": ["service_name"],
+  "aggregates": [{"function":"SUM","field_name":"notices","alias":"notices"}],
+  "sort": [{"field_name":"notices","order":"desc"}],
   "max_count": 10
 }
 
-// Defamation requests by product
+// Appeals upheld vs reversed for one platform
 {
-  "query": {"and": [{"operation":"EQ","field_name":"reason_name","field_values":["Defamation"]}]},
-  "group_by": ["product_name"],
-  "aggregates": [{"function":"SUM","field_name":"num_requests","alias":"requests"}],
-  "sort": [{"field_name":"requests","order":"desc"}]
+  "table": "t7_appeals_recidivism",
+  "query": {"and": [{"operation":"EQ","field_name":"service_name","field_values":["YouTube"]}]},
+  "group_by": ["indicator","scope"],
+  "aggregates": [{"function":"SUM","field_name":"value","alias":"value"}]
 }
 
-// Trend of EU items requested over time
+// Platforms ranked by EU monthly active recipients (AMAR)
 {
-  "query": {"and": [{"operation":"IN","field_name":"country_code",
-    "field_values":["DE","FR","IT","ES","PL","NL","BE","SE","AT","IE"]}]},
-  "group_by": ["period_label"],
-  "aggregates": [{"function":"SUM","field_name":"items_requested","alias":"items"}],
-  "sort": [{"field_name":"period_label","order":"asc"}]
+  "table": "t10_amar",
+  "group_by": ["service_name","platform"],
+  "aggregates": [{"function":"MAX","field_name":"value","alias":"amar"}],
+  "sort": [{"field_name":"amar","order":"desc"}]
+}
+
+// Qualitative moderation descriptions for one platform (free text)
+{
+  "table": "t11_qualitative",
+  "query": {"and": [{"operation":"EQ","field_name":"service_name","field_values":["TikTok"]}]},
+  "fields": ["service_name","indicator","qualitative_text"]
 }
 ```
 

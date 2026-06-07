@@ -108,19 +108,9 @@
   <section class="card hidden" id="schema-card">
     <h2>Dataset schema</h2>
     <p class="sub">Everything you can query, loaded with your new key.</p>
+    <p class="hint" id="dataset-meta"></p>
 
-    <div id="fields">
-      <div class="field-cat">
-        <h3>Dimensions <span class="dim">· filter / group / sort</span></h3>
-        <div id="dimensions"></div>
-      </div>
-      <div class="field-cat">
-        <h3>Measures <span class="dim">· filter / aggregate</span></h3>
-        <div id="measures"></div>
-      </div>
-    </div>
-
-    <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:18px 0 10px;">Tables</h3>
+    <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:18px 0 10px;">Report tables</h3>
     <div id="tables"></div>
   </section>
 
@@ -139,31 +129,24 @@ async function api(path, key) {
   return res.json();
 }
 
-function pills(target, names) {
-  $(target).innerHTML = names.map((n) => `<span class="pill">${n}</span>`).join("");
+function pillsHTML(names) {
+  return (names.length ? names : ["—"]).map((n) => `<span class="pill">${n}</span>`).join("");
 }
 
 function renderTable(t) {
-  const rows = t.columns.map((c) => `
-    <tr>
-      <td>${c.name}</td>
-      <td class="type">${c.type}</td>
-      <td class="flag">${c.pk ? "PK" : (c.notnull ? "NOT NULL" : "")}</td>
-    </tr>`).join("");
   return `<div class="tbl">
     <div class="name">${t.table}</div>
-    <table><thead><tr><th>column</th><th>type</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="hint">${t.description || ""}</p>
+    <div class="field-cat"><h3>Dimensions <span class="dim">· filter / group / sort</span></h3>${pillsHTML(t.dimensions.fields)}</div>
+    <div class="field-cat"><h3>Measures <span class="dim">· filter / aggregate</span></h3>${pillsHTML(t.measures.fields)}</div>
   </div>`;
 }
 
 async function loadSchema() {
-  const fields = await api("/fields", apiKey);
-  pills("#dimensions", fields.dimensions.fields);
-  pills("#measures", fields.measures.fields);
-
-  const { tables } = await api("/tables", apiKey);
-  // Fetch every table's schema in parallel rather than one roundtrip at a time.
-  const details = await Promise.all(tables.map((name) => api(`/schema/${name}`, apiKey)));
+  const meta = await api("/tables", apiKey);
+  $("#dataset-meta").textContent = `${meta.dataset} · period ${meta.period} · ${meta.tables.length} report tables`;
+  // Fetch every table's field registry in parallel rather than one roundtrip at a time.
+  const details = await Promise.all(meta.tables.map((t) => api(`/schema/${t.name}`, apiKey)));
   $("#tables").innerHTML = details.map(renderTable).join("");
   show($("#schema-card"));
 }

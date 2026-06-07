@@ -581,14 +581,15 @@ _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="s
 _callback_executor = ThreadPoolExecutor(max_workers=CALLBACK_WORKERS, thread_name_prefix="callback-worker")
 
 app = FastAPI(
-    title="Structured Query Demo API (async jobs)",
+    title="DSA VLOP Transparency Query API (async jobs)",
     description=(
-        "Describe a query with structured parameters (no SQL), get a job id, "
-        "poll for results as JSON or CSV. Query syntax follows the TikTok "
-        "Research API: boolean and/or/not clauses of {operation, field_name, "
-        "field_values}."
+        "Query the aggregated EU Digital Services Act VLOP transparency reports "
+        "(tables 3–11) with structured parameters (no SQL). Pick a `table` "
+        "(GET /tables), describe filters/group_by/aggregates, get a job id, then "
+        "poll for results as JSON or CSV. Query syntax follows the TikTok Research "
+        "API: boolean and/or/not clauses of {operation, field_name, field_values}."
     ),
-    version="0.4.0",
+    version="0.5.0",
 )
 
 
@@ -642,36 +643,107 @@ async def log_requests(request: Request, call_next):
 # a single parameterised SELECT. Unknown fields, bad operations, or injection
 # attempts in values can't reach the database as code — values are always bound.
 
-# field_name → SQL expression. Dimensions are text columns from the joined
-# lookup tables; measures are the numeric count columns on the fact table.
-_DIMENSIONS: dict[str, str] = {
-    "period_label": "p.label",
-    "country_code": "c.code",
-    "country_name": "c.name",
-    "requestor_name": "rq.name",
-    "product_name": "pr.name",
-    "reason_name": "rn.name",
-}
-_MEASURES: dict[str, str] = {
-    "num_requests": "r.num_requests",
-    "items_requested": "r.items_requested",
-    "removed_legal": "r.removed_legal",
-    "removed_policy": "r.removed_policy",
-    "not_found": "r.not_found",
-    "not_enough_info": "r.not_enough_info",
-    "no_action": "r.no_action",
-    "already_removed": "r.already_removed",
-}
-_ALL_FIELDS: dict[str, str] = {**_DIMENSIONS, **_MEASURES}
+# The dataset is the aggregated EU DSA VLOP transparency data — one queryable
+# table per DSA report table (t3–t11). A query names a `table`; that table's
+# TableSpec fixes the FROM/joins and the registry of dimension (text, EQ/IN) and
+# measure (numeric) fields. field_name → SQL expression is the per-table trust
+# boundary: only registered fields reach SQL, and every value is bound with ?.
 
-_FROM = (
-    "FROM removals r "
-    "JOIN periods p ON p.id = r.period_id "
-    "JOIN countries c ON c.id = r.country_id "
-    "JOIN requestors rq ON rq.id = r.requestor_id "
-    "JOIN products pr ON pr.id = r.product_id "
-    "JOIN reasons rn ON rn.id = r.reason_id"
-)
+
+@dataclass(frozen=True)
+class TableSpec:
+    description: str
+    from_sql: str
+    dimensions: dict[str, str]  # field_name → SQL expr (text; EQ/IN)
+    measures: dict[str, str]    # field_name → SQL expr (numeric; EQ/IN/GT/GTE/LT/LTE, aggregates)
+
+    @property
+    def all_fields(self) -> dict[str, str]:
+        return {**self.dimensions, **self.measures}
+
+
+# Dimensions common to every report table (every fact joins `services s`).
+_SVC = {"service_name": "s.name", "platform": "s.platform"}
+# The 16 own-initiative restriction-type measures shared by t5 and t6.
+_OWN_INIT_MEASURES = {
+    "measures": "f.measures", "automated": "f.automated",
+    "vis_removal": "f.vis_removal", "vis_disable": "f.vis_disable",
+    "vis_demoted": "f.vis_demoted", "vis_age_restricted": "f.vis_age_restricted",
+    "vis_interaction_restricted": "f.vis_interaction_restricted",
+    "vis_labelled": "f.vis_labelled", "vis_other": "f.vis_other",
+    "monetary_suspension": "f.monetary_suspension",
+    "monetary_termination": "f.monetary_termination", "monetary_other": "f.monetary_other",
+    "service_suspension": "f.service_suspension", "service_termination": "f.service_termination",
+    "account_suspension": "f.account_suspension", "account_termination": "f.account_termination",
+}
+_J_SVC = "JOIN services s ON s.id = f.service_id"
+_J_CAT = "JOIN categories c ON c.id = f.category_id"
+_J_SEC = "JOIN sections se ON se.id = f.section_id"
+_J_IND = "JOIN indicators i ON i.id = f.indicator_id"
+_J_SCOPE = "JOIN scopes sc ON sc.id = f.scope_id"
+_J_SURF = "JOIN surfaces su ON su.id = f.surface_id"
+_CAT_DIMS = {"category_code": "c.code", "category_label": "c.label"}
+
+TABLES: dict[str, TableSpec] = {
+    "t3_member_state_orders": TableSpec(
+        "Member-State orders to act on illegal content / to provide information (Art. 9 & 10), by category and scope.",
+        f"FROM t3_member_state_orders f {_J_SVC} {_J_CAT} {_J_SCOPE}",
+        {**_SVC, **_CAT_DIMS, "scope": "sc.name"},
+        {"orders_to_act": "f.orders_to_act", "items": "f.items",
+         "orders_to_provide_info": "f.orders_to_provide_info"},
+    ),
+    "t4_notices": TableSpec(
+        "Notices submitted under Art. 16, by category, with Trusted-Flagger (tf_) breakdowns.",
+        f"FROM t4_notices f {_J_SVC} {_J_CAT}",
+        {**_SVC, **_CAT_DIMS},
+        {"notices": "f.notices", "tf_notices": "f.tf_notices", "items": "f.items",
+         "tf_items": "f.tf_items", "median_time": "f.median_time", "tf_median_time": "f.tf_median_time",
+         "actions_law": "f.actions_law", "tf_actions_law": "f.tf_actions_law",
+         "actions_tos": "f.actions_tos", "tf_actions_tos": "f.tf_actions_tos"},
+    ),
+    "t5_own_initiative_illegal": TableSpec(
+        "Own-initiative actions on illegal content, by category × restriction type.",
+        f"FROM t5_own_initiative_illegal f {_J_SVC} {_J_CAT}",
+        {**_SVC, **_CAT_DIMS},
+        dict(_OWN_INIT_MEASURES),
+    ),
+    "t6_own_initiative_tos": TableSpec(
+        "Own-initiative actions on ToS violations, by category × restriction type × surface.",
+        f"FROM t6_own_initiative_tos f {_J_SVC} {_J_CAT} {_J_SURF}",
+        {**_SVC, **_CAT_DIMS, "surface": "su.name"},
+        dict(_OWN_INIT_MEASURES),
+    ),
+    "t7_appeals_recidivism": TableSpec(
+        "Appeals & recidivism (internal complaints, out-of-court disputes, repeat-offender suspensions), by section × indicator × scope × surface.",
+        f"FROM t7_appeals_recidivism f {_J_SVC} {_J_SEC} {_J_IND} {_J_SCOPE} {_J_SURF}",
+        {**_SVC, "section": "se.name", "indicator": "i.name", "scope": "sc.name", "surface": "su.name"},
+        {"value": "f.value"},
+    ),
+    "t8_automated_means": TableSpec(
+        "Use of automated means for content moderation, by section × indicator × scope × surface.",
+        f"FROM t8_automated_means f {_J_SVC} {_J_SEC} {_J_IND} {_J_SCOPE} {_J_SURF}",
+        {**_SVC, "section": "se.name", "indicator": "i.name", "scope": "sc.name", "surface": "su.name"},
+        {"value": "f.value"},
+    ),
+    "t9_human_resources": TableSpec(
+        "Human resources dedicated to content moderation, by section × indicator × scope.",
+        f"FROM t9_human_resources f {_J_SVC} {_J_SEC} {_J_IND} {_J_SCOPE}",
+        {**_SVC, "section": "se.name", "indicator": "i.name", "scope": "sc.name"},
+        {"value": "f.value"},
+    ),
+    "t10_amar": TableSpec(
+        "Average Monthly Active Recipients (AMAR) in the EU, by scope.",
+        f"FROM t10_amar f {_J_SVC} {_J_SCOPE}",
+        {**_SVC, "scope": "sc.name"},
+        {"value": "f.value"},
+    ),
+    "t11_qualitative": TableSpec(
+        "Qualitative description (free text), by indicator. No numeric measures — request `qualitative_text` in `fields`.",
+        f"FROM t11_qualitative f {_J_SVC} {_J_IND}",
+        {**_SVC, "indicator": "i.name", "qualitative_text": "f.value_text"},
+        {},
+    ),
+}
 
 # operation → SQL comparator (numeric fields only)
 _COMPARATORS = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}
@@ -681,7 +753,7 @@ SortOrder = Literal["asc", "desc"]
 
 
 class Condition(BaseModel):
-    """A single filter, e.g. {operation: IN, field_name: country_code, field_values: [DE, FR]}."""
+    """A single filter, e.g. {operation: IN, field_name: service_name, field_values: [YouTube, TikTok]}."""
 
     operation: Operation = Field(..., description="EQ, IN, GT, GTE, LT, LTE.")
     field_name: str = Field(..., description="A queryable field; see GET /fields.")
@@ -701,7 +773,7 @@ class BooleanQuery(BaseModel):
 
 
 class Aggregate(BaseModel):
-    """An aggregate column, e.g. {function: SUM, field_name: items_requested, alias: items}."""
+    """An aggregate column, e.g. {function: SUM, field_name: notices, alias: notices}."""
 
     function: AggFunction
     field_name: str = Field(default="*", description="A measure field, or '*' for COUNT.")
@@ -716,6 +788,9 @@ class Sort(BaseModel):
 class QueryRequest(BaseModel):
     """Structured query. No SQL is accepted."""
 
+    table: str | None = Field(
+        default=None, description="Which DSA report table to query (see GET /tables)."
+    )
     query: BooleanQuery = Field(default_factory=BooleanQuery, description="Filters.")
     fields: list[str] | None = Field(
         default=None,
@@ -749,12 +824,12 @@ def _require_string(value: Any, field_name: str) -> None:
         raise QueryCompileError(f"Field '{field_name}' requires string values.")
 
 
-def _compile_condition(cond: Condition) -> tuple[str, list[Any]]:
+def _compile_condition(cond: Condition, spec: TableSpec) -> tuple[str, list[Any]]:
     field = cond.field_name
-    if field not in _ALL_FIELDS:
-        raise QueryCompileError(f"Unknown field '{field}'. See GET /fields.")
-    col = _ALL_FIELDS[field]
-    is_measure = field in _MEASURES
+    if field not in spec.all_fields:
+        raise QueryCompileError(f"Unknown field '{field}' for this table. See GET /fields?table=…")
+    col = spec.all_fields[field]
+    is_measure = field in spec.measures
     op = cond.operation
     values = cond.field_values
 
@@ -787,14 +862,14 @@ def _compile_condition(cond: Condition) -> tuple[str, list[Any]]:
     raise QueryCompileError(f"Unsupported operation '{op}'.")  # pragma: no cover
 
 
-def _compile_where(q: BooleanQuery) -> tuple[str, list[Any]]:
+def _compile_where(q: BooleanQuery, spec: TableSpec) -> tuple[str, list[Any]]:
     groups: list[str] = []
     params: list[Any] = []
 
     def _and(conditions: list[Condition]) -> str:
         frags = []
         for c in conditions:
-            frag, p = _compile_condition(c)
+            frag, p = _compile_condition(c, spec)
             frags.append(frag)
             params.extend(p)
         return " AND ".join(frags)
@@ -804,14 +879,14 @@ def _compile_where(q: BooleanQuery) -> tuple[str, list[Any]]:
     if q.or_:
         frags = []
         for c in q.or_:
-            frag, p = _compile_condition(c)
+            frag, p = _compile_condition(c, spec)
             frags.append(frag)
             params.extend(p)
         groups.append("(" + " OR ".join(frags) + ")")
     if q.not_:
         frags = []
         for c in q.not_:
-            frag, p = _compile_condition(c)
+            frag, p = _compile_condition(c, spec)
             frags.append(f"NOT ({frag})")
             params.extend(p)
         groups.append(" AND ".join(frags))
@@ -827,7 +902,15 @@ def _safe_alias(alias: str) -> str:
 
 def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
     """Validate a structured query and compile it to (sql, params, output_columns)."""
-    where, params = _compile_where(req.query)
+    if not req.table:
+        raise QueryCompileError(
+            "`table` is required. Choose one of: " + ", ".join(TABLES) + ". See GET /tables."
+        )
+    spec = TABLES.get(req.table)
+    if spec is None:
+        raise QueryCompileError(f"Unknown table '{req.table}'. See GET /tables.")
+
+    where, params = _compile_where(req.query, spec)
     aggregating = bool(req.aggregates) or bool(req.group_by)
 
     if aggregating and req.fields:
@@ -839,11 +922,11 @@ def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
 
     if aggregating:
         for gb in req.group_by:
-            if gb not in _DIMENSIONS:
-                raise QueryCompileError(f"group_by field '{gb}' must be a dimension. See GET /fields.")
+            if gb not in spec.dimensions:
+                raise QueryCompileError(f"group_by field '{gb}' must be a dimension of '{req.table}'. See GET /fields?table={req.table}")
             if gb in col_expr:
                 raise QueryCompileError(f"Duplicate group_by field '{gb}'.")
-            expr = _DIMENSIONS[gb]
+            expr = spec.dimensions[gb]
             select_parts.append(f"{expr} AS {gb}")
             columns.append(gb)
             col_expr[gb] = expr
@@ -853,25 +936,25 @@ def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
                 raise QueryCompileError(f"Duplicate or clashing output column '{alias}'.")
             if agg.function == "COUNT" and agg.field_name in ("*", ""):
                 expr = "COUNT(*)"
-            elif agg.field_name not in _MEASURES:
+            elif agg.field_name not in spec.measures:
                 raise QueryCompileError(
-                    f"Aggregate field '{agg.field_name}' must be a numeric measure. See GET /fields."
+                    f"Aggregate field '{agg.field_name}' must be a numeric measure of '{req.table}'. See GET /fields?table={req.table}"
                 )
             else:
-                expr = f"{agg.function}({_MEASURES[agg.field_name]})"
+                expr = f"{agg.function}({spec.measures[agg.field_name]})"
             select_parts.append(f"{expr} AS {alias}")
             columns.append(alias)
             col_expr[alias] = expr
     else:
-        fields = req.fields if req.fields is not None else list(_ALL_FIELDS)
+        fields = req.fields if req.fields is not None else list(spec.all_fields)
         if not fields:
             raise QueryCompileError("`fields` must name at least one column.")
         for f in fields:
-            if f not in _ALL_FIELDS:
-                raise QueryCompileError(f"Unknown field '{f}'. See GET /fields.")
+            if f not in spec.all_fields:
+                raise QueryCompileError(f"Unknown field '{f}' for table '{req.table}'. See GET /fields?table={req.table}")
             if f in col_expr:
                 raise QueryCompileError(f"Duplicate field '{f}' in fields list.")
-            expr = _ALL_FIELDS[f]
+            expr = spec.all_fields[f]
             select_parts.append(f"{expr} AS {f}")
             columns.append(f)
             col_expr[f] = expr
@@ -886,11 +969,11 @@ def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
 
     limit = min(req.max_count, ROW_LIMIT)
 
-    sql = f"SELECT {', '.join(select_parts)} {_FROM}"
+    sql = f"SELECT {', '.join(select_parts)} {spec.from_sql}"
     if where:
         sql += f" WHERE {where}"
     if req.group_by:
-        sql += " GROUP BY " + ", ".join(_DIMENSIONS[g] for g in req.group_by)
+        sql += " GROUP BY " + ", ".join(spec.dimensions[g] for g in req.group_by)
     if order_parts:
         sql += " ORDER BY " + ", ".join(order_parts)
     sql += f" LIMIT {limit}"
@@ -1069,29 +1152,33 @@ def _job_for_owner(job_id: str, owner_key: str) -> Job:
 
 @app.get("/")
 def root() -> dict[str, Any]:
+    meta = _dataset_meta()
     return {
-        "name": "Structured Query Demo API",
+        "name": "DSA VLOP Transparency Query API",
+        "dataset": "EU Digital Services Act VLOP/VLOSE transparency reports (tables 3–11)",
+        "period": meta.get("period"),
         "pattern": "async-job",
-        "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted)",
+        "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted); pick a `table` (GET /tables)",
         "auth": "X-API-Key header required for all endpoints except `/`, `/docs`, `/openapi.json`",
         "endpoints": {
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
             "POST /portal/register": "Issue a demo API key for a researcher (rate-limited, expiring)",
             "DELETE /portal/key": "Revoke your portal-issued key",
-            "POST /query": "Submit a structured query (optional callback_url webhook), returns 202 + job_id",
+            "POST /query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
             "GET /jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
             "GET /jobs/{job_id}/download?...": "Secure result download via a signed, expiring URL (no key)",
             "DELETE /jobs/{job_id}": "Cancel a queued/running job, or remove a finished one",
-            "GET /fields": "List queryable fields and operations",
-            "GET /tables": "List tables in the demo database",
-            "GET /schema/{table}": "Show columns for a table",
+            "GET /tables": "List the queryable DSA report tables",
+            "GET /fields?table=…": "Fields and operations for a table",
+            "GET /schema/{table}": "Field registry for a report table",
             "GET /healthz": "Liveness probe",
             "GET /readyz": "Readiness probe (checks DB connection)",
             "GET /metrics": "Prometheus metrics (no auth)",
             "GET /docs": "Interactive Swagger UI",
         },
+        "tables": list(TABLES),
         "row_limit": ROW_LIMIT,
         "worker_threads": WORKER_THREADS,
         "store": "upstash" if UPSTASH_REDIS_REST_URL else ("redis" if REDIS_URL else "memory"),
@@ -1198,65 +1285,92 @@ def ready() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/fields")
-def list_fields(_: dict = Depends(require_api_key)) -> dict[str, Any]:
-    """Document the queryable fields and the operations each one supports."""
-    return {
-        "dimensions": {
-            "fields": sorted(_DIMENSIONS),
-            "operations": ["EQ", "IN"],
-            "usable_in": ["query", "fields", "group_by", "sort"],
-            "note": "Text fields from the lookup tables.",
-        },
-        "measures": {
-            "fields": sorted(_MEASURES),
-            "operations": ["EQ", "IN", "GT", "GTE", "LT", "LTE"],
-            "usable_in": ["query", "fields", "aggregates"],
-            "note": "Numeric count columns on the removals fact table.",
-        },
-        "aggregate_functions": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
-        "example": {
-            "query": {
-                "and": [
-                    {"operation": "IN", "field_name": "country_code", "field_values": ["DE", "FR"]},
-                    {"operation": "EQ", "field_name": "reason_name", "field_values": ["Defamation"]},
-                ]
-            },
-            "group_by": ["product_name"],
-            "aggregates": [
-                {"function": "SUM", "field_name": "num_requests", "alias": "requests"}
-            ],
-            "sort": [{"field_name": "requests", "order": "desc"}],
+def _dataset_meta() -> dict[str, str]:
+    try:
+        conn = _connect_ro()
+        try:
+            return {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
+def _example_for(table: str, spec: TableSpec) -> dict[str, Any]:
+    """A runnable example query for a table — aggregate its first measure, or
+    (for the text-only t11) fetch the qualitative field for one service."""
+    measures = list(spec.measures)
+    if measures:
+        return {
+            "table": table,
+            "group_by": ["service_name"],
+            "aggregates": [{"function": "SUM", "field_name": measures[0], "alias": "total"}],
+            "sort": [{"field_name": "total", "order": "desc"}],
             "max_count": 10,
-        },
+        }
+    return {
+        "table": table,
+        "query": {"and": [{"operation": "EQ", "field_name": "service_name", "field_values": ["YouTube"]}]},
+        "fields": [f for f in spec.dimensions if f != "platform"],
+        "max_count": 10,
     }
 
 
+def _table_fields_doc(table: str, spec: TableSpec) -> dict[str, Any]:
+    return {
+        "table": table,
+        "description": spec.description,
+        "dimensions": {
+            "fields": sorted(spec.dimensions),
+            "operations": ["EQ", "IN"],
+            "usable_in": ["query", "fields", "group_by", "sort"],
+            "note": "Text fields from the joined lookup tables.",
+        },
+        "measures": {
+            "fields": sorted(spec.measures),
+            "operations": ["EQ", "IN", "GT", "GTE", "LT", "LTE"],
+            "usable_in": ["query", "fields", "aggregates"],
+            "note": "Numeric measure columns on the fact table.",
+        },
+        "aggregate_functions": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
+        "example": _example_for(table, spec),
+    }
+
+
+@app.get("/fields")
+def list_fields(table: str | None = None, _: dict = Depends(require_api_key)) -> dict[str, Any]:
+    """Fields for a report table (`?table=…`), or an overview of all tables."""
+    if table is None:
+        return {
+            "note": "Pass ?table=<name> for a table's fields, or GET /schema/{table}.",
+            "tables": {name: spec.description for name, spec in TABLES.items()},
+            "aggregate_functions": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
+        }
+    spec = TABLES.get(table)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown table '{table}'. See GET /tables.")
+    return _table_fields_doc(table, spec)
+
+
 @app.get("/tables")
-def list_tables(_: dict = Depends(require_api_key)) -> dict[str, list[str]]:
-    with _connect_ro() as conn:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall()
-    return {"tables": [r[0] for r in rows]}
+def list_tables(_: dict = Depends(require_api_key)) -> dict[str, Any]:
+    """The queryable DSA report tables and the dataset's reporting period."""
+    meta = _dataset_meta()
+    return {
+        "dataset": "EU DSA VLOP transparency reports",
+        "period": meta.get("period"),
+        "generated": meta.get("generated"),
+        "tables": [{"name": name, "description": spec.description} for name, spec in TABLES.items()],
+    }
 
 
 @app.get("/schema/{table}")
 def table_schema(table: str, _: dict = Depends(require_api_key)) -> dict[str, Any]:
-    if not table.replace("_", "").isalnum():
-        raise HTTPException(status_code=400, detail="Invalid table name.")
-    with _connect_ro() as conn:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    return {
-        "table": table,
-        "columns": [
-            {"name": r[1], "type": r[2], "notnull": bool(r[3]), "pk": bool(r[5])}
-            for r in rows
-        ],
-    }
+    """The queryable field registry (dimensions + measures) for a report table."""
+    spec = TABLES.get(table)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Table '{table}' not found. See GET /tables.")
+    return _table_fields_doc(table, spec)
 
 
 @app.post("/query", status_code=202)
