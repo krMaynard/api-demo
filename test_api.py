@@ -645,3 +645,10 @@ class TestMetrics:
         _submit_and_wait(COUNT_ALL)
         after = REGISTRY.get_sample_value("api_demo_jobs_total", {"status": "done"})
         assert after is not None and after >= before + 1
+
+    def test_queue_depth_balances_to_zero_at_rest(self):
+        from prometheus_client import REGISTRY
+
+        # inc on submit / dec on pickup should net to zero once the job is done.
+        _submit_and_wait(COUNT_ALL)
+        assert REGISTRY.get_sample_value("api_demo_job_queue_depth") == 0.0

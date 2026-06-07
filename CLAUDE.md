@@ -134,7 +134,8 @@ bind with `?`).
   records `api_demo_http_requests_total` + `_http_request_duration_seconds`,
   labelled by the **route template** (`/jobs/{job_id}`) to bound cardinality; the
   job runner tracks `api_demo_jobs_in_flight`, `api_demo_jobs_total{status}`, and
-  `api_demo_job_queue_depth` (read from the executor queue at scrape time).
+  `api_demo_job_queue_depth` (inc'd on submit, dec'd when the worker picks the job
+  up — no reliance on `ThreadPoolExecutor` internals).
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
 

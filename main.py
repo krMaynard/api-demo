@@ -514,8 +514,6 @@ _redis = _make_redis_client()
 _store: MemoryJobStore | RedisJobStore = _make_store()
 _key_store: MemoryKeyStore | RedisKeyStore = _make_key_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
-# Evaluated lazily at scrape time — reflects queued work waiting for a free worker.
-JOB_QUEUE_DEPTH.set_function(lambda: _executor._work_queue.qsize())
 
 app = FastAPI(
     title="Structured Query Demo API (async jobs)",
@@ -846,6 +844,7 @@ def _connect_ro() -> sqlite3.Connection:
 
 
 def _execute_job(job_id: str) -> None:
+    JOB_QUEUE_DEPTH.dec()  # dequeued — now running (or about to early-return)
     job = _store.get(job_id)
     if job is None or job.status == "cancelled":
         return
@@ -1146,6 +1145,7 @@ def submit_query(
         submitted_by=principal["name"],
     )
     _store.put(job)
+    JOB_QUEUE_DEPTH.inc()  # queued; decremented when _execute_job picks it up
     _executor.submit(_execute_job, job.id)
     logger.info("job_submitted", extra={"data": {"job_id": job.id, "user": principal["name"]}})
     response.headers["Location"] = f"/jobs/{job.id}"
