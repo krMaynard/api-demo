@@ -1287,8 +1287,11 @@ def ready() -> dict[str, str]:
 
 def _dataset_meta() -> dict[str, str]:
     try:
-        with _connect_ro() as conn:
+        conn = _connect_ro()
+        try:
             return {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+        finally:
+            conn.close()
     except Exception:
         return {}
 
