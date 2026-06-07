@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Research Data Portal · Government Content Removals</title>
+<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #30363d;
@@ -67,6 +68,10 @@
   td.flag { color: var(--muted); font-family: var(--mono); }
   footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 8px; }
   footer a { color: var(--accent); text-decoration: none; }
+  .gbtn { display: flex; justify-content: center; margin: 4px 0 2px; min-height: 44px; }
+  .divider { display: flex; align-items: center; text-align: center; color: var(--muted); font-size: 13px; margin: 18px 0 4px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  .divider span { padding: 0 12px; }
 </style>
 </head>
 <body>
@@ -80,15 +85,33 @@
   <!-- Step 1: sign in -->
   <section class="card" id="login-card">
     <h2>Request API access</h2>
-    <p class="sub">Sign in with your details to be issued an API key. (Demo — no real authentication.)</p>
-    <form id="login-form" autocomplete="off">
+    <p class="sub" id="login-sub">Sign in to be issued an API key.</p>
+
+    <!-- Google sign-in (shown when GOOGLE_CLIENT_ID is configured) -->
+    <div id="google-block" class="hidden">
+      <div class="gbtn" id="google-btn"></div>
+      <p class="hint">New accounts are reviewed by an administrator before access is granted.</p>
+    </div>
+
+    <!-- Divider, shown only when both Google and demo sign-in are available -->
+    <div class="divider hidden" id="auth-divider"><span>or use a demo identity</span></div>
+
+    <!-- Demo registration (shown when ALLOW_DEMO_KEYS is on) -->
+    <form id="login-form" autocomplete="off" class="hidden">
       <label for="name">Full name</label>
       <input id="name" name="name" placeholder="Dr. Ada Lovelace" />
       <label for="email">Work email</label>
       <input id="email" name="email" placeholder="ada@royalsociety.org" />
       <button id="submit" type="submit">Request API key</button>
-      <div class="error" id="error"></div>
     </form>
+    <div class="error" id="error"></div>
+  </section>
+
+  <!-- Pending admin approval -->
+  <section class="card hidden" id="pending-card">
+    <h2>Request received ⏳</h2>
+    <p class="sub">Thanks, <span id="pending-who">researcher</span> — your access request is
+      awaiting administrator approval. Sign in again once it's been approved.</p>
   </section>
 
   <!-- Step 2: issued key -->
@@ -151,6 +174,68 @@ async function loadSchema() {
   show($("#schema-card"));
 }
 
+// Common success path for both Google sign-in and demo registration: an issued
+// key/session that unlocks the schema view.
+async function onAuthSuccess(data) {
+  apiKey = data.api_key;
+  $("#who").textContent = data.name;
+  $("#apikey").textContent = apiKey;
+  if (data.expires_at) {
+    const d = new Date(data.expires_at);
+    $("#expires").textContent = "Expires " + d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" }) + ".";
+  }
+  $("#login-card").classList.add("hidden");
+  show($("#key-card"));
+  await loadSchema();
+}
+
+// ── Google sign-in ──────────────────────────────────────────────────────────
+// The GSI client library (FedCM-backed) hands us an ID token; we POST it to
+// /auth/google, which verifies it and either mints a session or queues the
+// account for admin approval.
+async function onGoogleCredential(resp) {
+  $("#error").textContent = "";
+  try {
+    const r = await fetch("/auth/google", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential: resp.credential }),
+    });
+    const data = await r.json();
+    if (r.status === 202) {  // pending admin approval
+      $("#pending-who").textContent = data.email || "researcher";
+      $("#login-card").classList.add("hidden");
+      show($("#pending-card"));
+      return;
+    }
+    if (!r.ok) throw new Error(data.detail || "Sign-in failed");
+    await onAuthSuccess(data);
+  } catch (err) {
+    $("#error").textContent = err.message;
+  }
+}
+
+function setupGoogle(clientId) {
+  const render = () => {
+    if (!window.google || !window.google.accounts || !window.google.accounts.id) return false;
+    google.accounts.id.initialize({
+      client_id: clientId,
+      callback: onGoogleCredential,
+      use_fedcm_for_prompt: true,
+    });
+    google.accounts.id.renderButton($("#google-btn"), {
+      theme: "filled_blue", size: "large", shape: "pill", text: "signin_with", logo_alignment: "left",
+    });
+    show($("#google-block"));
+    return true;
+  };
+  // The library loads async — poll briefly until it's ready.
+  if (!render()) {
+    let tries = 0;
+    const iv = setInterval(() => { if (render() || ++tries > 50) clearInterval(iv); }, 100);
+  }
+}
+
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("#error").textContent = "";
@@ -168,22 +253,33 @@ $("#login-form").addEventListener("submit", async (e) => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Registration failed");
-
-    apiKey = data.api_key;
-    $("#who").textContent = data.name;
-    $("#apikey").textContent = apiKey;
-    if (data.expires_at) {
-      const d = new Date(data.expires_at);
-      $("#expires").textContent = "Expires " + d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" }) + ".";
-    }
-    show($("#key-card"));
-    await loadSchema();
+    await onAuthSuccess(data);
   } catch (err) {
     $("#error").textContent = err.message;
   } finally {
     btn.disabled = false; btn.textContent = "Request API key";
   }
 });
+
+// Decide which sign-in methods to offer based on server config.
+async function init() {
+  let cfg = {};
+  try { cfg = (await (await fetch("/")).json()).auth_config || {}; } catch (_) {}
+  const googleOn = !!(cfg.google_signin && cfg.google_client_id);
+  const demoOn = !!cfg.demo_keys;
+
+  if (googleOn) setupGoogle(cfg.google_client_id);
+  if (demoOn) show($("#login-form"));
+  if (googleOn && demoOn) show($("#auth-divider"));
+
+  $("#login-sub").textContent = googleOn
+    ? "Sign in with your Google account to request access."
+    : "Sign in with your details to be issued an API key. (Demo — no real authentication.)";
+  if (!googleOn && !demoOn) {
+    $("#login-sub").textContent = "No sign-in method is enabled on this server.";
+  }
+}
+init();
 
 $("#copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(apiKey || ""); } catch (_) {}
