@@ -129,6 +129,34 @@ client                          server
   │◀── rows (json or csv)         │
 ```
 
+### Webhook callbacks (poll *or* get notified)
+
+Polling is the default, but you can also include a `callback_url` in the
+`POST /query` body. When the job reaches a terminal state the server POSTs the
+job object (including signed `download_urls`) to that URL, so you don't have to
+poll:
+
+```jsonc
+POST /query
+{ "aggregates": [{"function": "COUNT", "alias": "n"}],
+  "callback_url": "https://your-service.example.com/hooks/jobs" }
+
+// later, server → your URL:
+POST /hooks/jobs
+X-Webhook-Signature: sha256=<hmac of the raw body>
+{ "event": "job.done", "job": { "job_id": "…", "status": "done", "download_urls": {…} } }
+```
+
+- **Verify the signature**: recompute `HMAC-SHA256(DOWNLOAD_URL_SECRET, raw_body)`
+  and compare to the `X-Webhook-Signature` header before trusting the payload.
+- **Delivery** is retried with backoff (`CALLBACK_MAX_ATTEMPTS`) off the query
+  worker threads; `done` and `failed` jobs notify, cancellations don't.
+- **SSRF-guarded**: the URL must be plain `http(s)` to a public host. Callbacks to
+  loopback / private / link-local / cloud-metadata addresses are rejected with
+  `400` at submit and re-checked before each send (set `CALLBACK_ALLOW_PRIVATE=1`
+  only for local development).
+- Set `PUBLIC_BASE_URL` so the links in the payload are absolute.
+
 ## Authentication
 
 Every endpoint except `/`, `/docs`, and `/openapi.json` requires a key in the
@@ -258,7 +286,7 @@ curl -i -H 'X-API-Key: bob' "http://127.0.0.1:8000/jobs/$JOB"   # -> 404
 | GET    | `/fields`                           | key  | List queryable fields and operations           |
 | GET    | `/tables`                           | key  | List tables                                    |
 | GET    | `/schema/{table}`                   | key  | Show a table's columns                         |
-| POST   | `/query`                            | key  | Submit a structured query — returns `202 + job_id` |
+| POST   | `/query`                            | key  | Submit a structured query (optional `callback_url`) — returns `202 + job_id` |
 | GET    | `/jobs`                             | key  | List **your** jobs                             |
 | GET    | `/jobs/{job_id}`                    | key  | Job status (your jobs only)                    |
 | GET    | `/jobs/{job_id}/result?format=…`    | key  | Result rows (only when `status=done`)          |
@@ -426,6 +454,11 @@ All tuneable values are read from environment variables at startup:
 | `QUERY_RATE_WINDOW_SECONDS` | `60` | Query rate-limit window |
 | `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
 | `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |
+| `PUBLIC_BASE_URL` | _(unset — relative links)_ | Base URL to make callback payload links absolute |
+| `CALLBACK_TIMEOUT_SECONDS` | `10` | Per-attempt webhook delivery timeout |
+| `CALLBACK_MAX_ATTEMPTS` | `3` | Webhook delivery attempts before giving up |
+| `CALLBACK_WORKERS` | `8` | Size of the bounded webhook delivery thread pool |
+| `CALLBACK_ALLOW_PRIVATE` | `0` | Allow callbacks to private/loopback hosts (dev only) |
 
 Copy `.env.example` to `.env` and edit before running Docker Compose.
 

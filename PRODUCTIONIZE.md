@@ -181,7 +181,16 @@ GET /jobs/{id}/result?format=json&limit=1000&after=<cursor>
 
 #### Webhook callbacks
 
-Add `callback_url` to `POST /query`. When the job finishes, POST the result URL to the callback with exponential-backoff retries.
+Shipped: `POST /query` accepts an optional `callback_url`. When the job finishes
+the server POSTs the job object (with signed `download_urls`) to it, HMAC-signed
+(`X-Webhook-Signature`) and retried with backoff off the query workers, and
+SSRF-guarded against private/loopback/metadata targets (`CALLBACK_*` env vars).
+A production hardening step would move delivery onto a durable queue (so retries
+survive a restart), add per-caller allowlisting of callback domains, and put SSRF
+protection at the network layer (egress firewall / proxy). The app-level guard
+re-validates the host before each send, but a determined DNS-rebinding attacker
+can still race the resolver between check and connect — egress filtering closes
+that gap definitively.
 
 #### API versioning
 

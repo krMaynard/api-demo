@@ -59,3 +59,6 @@ os.environ.setdefault("API_KEYS_JSON", '{"alice":{"name":"alice"},"bob":{"name":
 os.environ.setdefault("PORTAL_REGISTER_MAX_PER_WINDOW", "10000")
 os.environ.setdefault("QUERY_RATE_MAX_PER_WINDOW", "100000")
 os.environ.setdefault("LOG_FORMAT", "text")  # readable pytest output
+# Allow webhook callbacks to loopback so the end-to-end test can hit a local
+# capture server. The SSRF guard itself is unit-tested with the flag off.
+os.environ.setdefault("CALLBACK_ALLOW_PRIVATE", "1")

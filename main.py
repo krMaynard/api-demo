@@ -31,18 +31,28 @@ Configuration (environment variables):
     QUERY_RATE_WINDOW_SECONDS  the query rate-limit window in seconds (default: 60)
     LOG_LEVEL             log level for the api_demo logger (default: INFO)
     LOG_FORMAT            json (default) for structured logs, or text for human-readable
+    PUBLIC_BASE_URL       base URL used to make callback payload links absolute (default: relative)
+    CALLBACK_TIMEOUT_SECONDS  per-attempt webhook timeout (default: 10)
+    CALLBACK_MAX_ATTEMPTS     webhook delivery attempts before giving up (default: 3)
+    CALLBACK_WORKERS          size of the bounded webhook delivery pool (default: 8)
+    CALLBACK_ALLOW_PRIVATE    allow callbacks to private/loopback hosts — dev only (default: off)
 """
 import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import socket
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -87,6 +97,14 @@ QUERY_RATE_WINDOW = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
 # Structured logging: JSON lines by default, or LOG_FORMAT=text for humans.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.getenv("LOG_FORMAT", "json").lower()
+# Webhook callbacks (optional callback_url on POST /query). Absolute links in the
+# payload need PUBLIC_BASE_URL; delivery retries with backoff; SSRF guard blocks
+# private/loopback/link-local targets unless CALLBACK_ALLOW_PRIVATE is set.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+CALLBACK_TIMEOUT = int(os.getenv("CALLBACK_TIMEOUT_SECONDS", "10"))
+CALLBACK_MAX_ATTEMPTS = int(os.getenv("CALLBACK_MAX_ATTEMPTS", "3"))
+CALLBACK_WORKERS = int(os.getenv("CALLBACK_WORKERS", "8"))
+CALLBACK_ALLOW_PRIVATE = os.getenv("CALLBACK_ALLOW_PRIVATE", "").lower() in ("1", "true", "yes")
 
 
 # ── Structured logging ──────────────────────────────────────────────────────────
@@ -146,6 +164,7 @@ HTTP_LATENCY = Histogram(
 JOBS_IN_FLIGHT = Gauge("api_demo_jobs_in_flight", "Jobs currently executing")
 JOBS_TOTAL = Counter("api_demo_jobs_total", "Jobs by terminal status", ["status"])
 JOB_QUEUE_DEPTH = Gauge("api_demo_job_queue_depth", "Queued jobs not yet started")
+CALLBACKS_TOTAL = Counter("api_demo_callbacks_total", "Webhook callback deliveries", ["result"])
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
@@ -210,6 +229,46 @@ def _verify_download_signature(job_id: str, fmt: str, expires: int, sig: str) ->
     return hmac.compare_digest(expected, sig)
 
 
+class CallbackUrlError(ValueError):
+    """Raised when a webhook callback_url is malformed or points somewhere unsafe."""
+
+
+def _validate_callback_url(url: str) -> None:
+    """Reject callback URLs that aren't plain http(s) to a routable public host.
+
+    A caller-supplied URL that the server then fetches is a classic SSRF vector:
+    without this guard it could be aimed at cloud metadata (169.254.169.254),
+    localhost, or other internal services. We resolve the host and reject any
+    private/loopback/link-local/reserved address. Set CALLBACK_ALLOW_PRIVATE=1 to
+    bypass for local development. This is re-checked just before delivery, so DNS
+    rebinding between submit and send is also caught.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise CallbackUrlError("callback_url must be an http(s) URL.")
+    host = parsed.hostname
+    if not host:
+        raise CallbackUrlError("callback_url has no host.")
+    if CALLBACK_ALLOW_PRIVATE:
+        return
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except OSError as exc:
+        raise CallbackUrlError(f"callback_url host did not resolve: {exc}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        # IPv4-mapped (::ffff:127.0.0.1) and 6to4 IPv6 addresses report
+        # is_private/is_loopback=False even when they embed a private IPv4 — unwrap
+        # to the embedded v4 so the guard can't be bypassed through them.
+        if isinstance(ip, ipaddress.IPv6Address):
+            ip = ip.ipv4_mapped or ip.sixtofour or ip
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            raise CallbackUrlError("callback_url resolves to a non-public address.")
+
+
 # ── Job model ─────────────────────────────────────────────────────────────────
 
 JobStatus = Literal["queued", "running", "done", "failed", "cancelled"]
@@ -228,6 +287,7 @@ class Job:
     finished_at: str | None = None
     error: str | None = None
     row_count: int | None = None
+    callback_url: str | None = None  # optional webhook notified on terminal state
     # columns/rows live in the result store, not on the job object.
     columns: list[str] | None = field(default=None, repr=False)
     rows: list[list[Any]] | None = field(default=None, repr=False)
@@ -353,6 +413,7 @@ class RedisJobStore:
             "finished_at": job.finished_at or "",
             "error": job.error or "",
             "row_count": "" if job.row_count is None else str(job.row_count),
+            "callback_url": job.callback_url or "",
         }
 
     def _from_hash(self, h: dict[str, str]) -> Job:
@@ -368,6 +429,7 @@ class RedisJobStore:
             finished_at=h.get("finished_at") or None,
             error=h.get("error") or None,
             row_count=int(h["row_count"]) if h.get("row_count") else None,
+            callback_url=h.get("callback_url") or None,
         )
 
     def put(self, job: Job) -> None:
@@ -514,6 +576,9 @@ _redis = _make_redis_client()
 _store: MemoryJobStore | RedisJobStore = _make_store()
 _key_store: MemoryKeyStore | RedisKeyStore = _make_key_store()
 _executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="sql-worker")
+# Webhook delivery runs on its own bounded pool so a flood of callbacks (or slow
+# receivers during retry backoff) can't exhaust threads or starve query workers.
+_callback_executor = ThreadPoolExecutor(max_workers=CALLBACK_WORKERS, thread_name_prefix="callback-worker")
 
 app = FastAPI(
     title="Structured Query Demo API (async jobs)",
@@ -660,6 +725,11 @@ class QueryRequest(BaseModel):
     aggregates: list[Aggregate] = Field(default_factory=list, description="Aggregate columns.")
     sort: list[Sort] = Field(default_factory=list, description="Result ordering.")
     max_count: int = Field(default=100, ge=1, description="Row limit (capped at ROW_LIMIT).")
+    callback_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Optional http(s) webhook POSTed (HMAC-signed) when the job finishes.",
+    )
 
 
 class QueryCompileError(ValueError):
@@ -832,6 +902,72 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Webhook callbacks ───────────────────────────────────────────────────────────
+
+# Opener that refuses to follow redirects — a 3xx could otherwise bounce a
+# validated public URL to an internal one, sidestepping the SSRF guard.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_callback_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _absolutise(public: dict[str, Any]) -> dict[str, Any]:
+    """Prefix relative status/result/download links with PUBLIC_BASE_URL (if set)."""
+    if not PUBLIC_BASE_URL:
+        return public
+    for key in ("status_url", "result_url"):
+        if public.get(key):
+            public[key] = PUBLIC_BASE_URL + public[key]
+    if public.get("download_urls"):
+        public["download_urls"] = {k: PUBLIC_BASE_URL + v for k, v in public["download_urls"].items()}
+    return public
+
+
+def _send_callback(job_id: str, callback_url: str, payload: dict[str, Any]) -> None:
+    """POST the job result to callback_url, HMAC-signed, with bounded retries."""
+    body = json.dumps(payload).encode()
+    signature = hmac.new(DOWNLOAD_URL_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": f"sha256={signature}",
+        "X-Job-Id": job_id,
+    }
+    for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            _validate_callback_url(callback_url)  # re-check (narrows DNS rebinding) before each send
+            req = urllib.request.Request(callback_url, data=body, headers=headers, method="POST")
+            with _callback_opener.open(req, timeout=CALLBACK_TIMEOUT) as resp:
+                status = resp.status  # the opener only returns for 2xx; 3xx/4xx/5xx raise HTTPError
+            CALLBACKS_TOTAL.labels("delivered").inc()
+            logger.info("callback_delivered", extra={"data": {
+                "job_id": job_id, "status": status, "attempt": attempt}})
+            return
+        except CallbackUrlError as exc:
+            CALLBACKS_TOTAL.labels("blocked").inc()
+            logger.warning("callback_blocked", extra={"data": {"job_id": job_id, "error": str(exc)}})
+            return  # don't retry a blocked target
+        except urllib.error.HTTPError as exc:
+            reason = f"HTTP {exc.code}"
+        except Exception as exc:  # network error, timeout, …
+            reason = f"{type(exc).__name__}: {exc}"
+        if attempt < CALLBACK_MAX_ATTEMPTS:
+            time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, …
+    CALLBACKS_TOTAL.labels("failed").inc()
+    logger.warning("callback_failed", extra={"data": {
+        "job_id": job_id, "attempts": CALLBACK_MAX_ATTEMPTS, "error": reason}})
+
+
+def _dispatch_callback(job: Job) -> None:
+    """Fire-and-forget callback delivery on the bounded callback pool (off query workers)."""
+    if not job.callback_url or job.status not in ("done", "failed"):
+        return
+    payload = {"event": f"job.{job.status}", "job": _absolutise(job.to_public())}
+    _callback_executor.submit(_send_callback, job.id, job.callback_url, payload)
+
+
 def _connect_ro() -> sqlite3.Connection:
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError("demo.db not found — run `python seed.py` first.")
@@ -915,6 +1051,11 @@ def _execute_job(job_id: str) -> None:
     finally:
         JOBS_IN_FLIGHT.dec()
 
+    # Notify the caller's webhook, if any (done/failed only; skips cancelled).
+    final = _store.get(job_id)
+    if final is not None:
+        _dispatch_callback(final)
+
 
 def _job_for_owner(job_id: str, owner_key: str) -> Job:
     """Return the job or 404. Foreign job IDs always return 404 to avoid leaking existence."""
@@ -937,7 +1078,7 @@ def root() -> dict[str, Any]:
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
             "POST /portal/register": "Issue a demo API key for a researcher (rate-limited, expiring)",
             "DELETE /portal/key": "Revoke your portal-issued key",
-            "POST /query": "Submit a structured query, returns 202 + job_id",
+            "POST /query": "Submit a structured query (optional callback_url webhook), returns 202 + job_id",
             "GET /jobs": "List your jobs",
             "GET /jobs/{job_id}": "Job status (your jobs only)",
             "GET /jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
@@ -1137,12 +1278,19 @@ def submit_query(
     except QueryCompileError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    if body.callback_url:
+        try:
+            _validate_callback_url(body.callback_url)
+        except CallbackUrlError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     job = Job(
         id=uuid.uuid4().hex,
         sql=sql,
         params=params,
         owner_key=principal["key"],
         submitted_by=principal["name"],
+        callback_url=body.callback_url,
     )
     _store.put(job)
     JOB_QUEUE_DEPTH.inc()  # queued; decremented when _execute_job picks it up

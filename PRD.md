@@ -93,6 +93,8 @@ A developer giving a live presentation who runs `demo.py --pause` to step throug
 | F-13 | If the query result exceeds `ROW_LIMIT` rows (default 100,000), the job fails with a descriptive error asking the caller to lower `max_count`. |
 | F-14 | Caller-authored SQL cannot be submitted at all, so there is no write/DDL path. As defence in depth the database is still opened read-only, so even a compiler bug could not mutate it. |
 | F-15 | `POST /query` is rate-limited per API key: more than `QUERY_RATE_MAX_PER_WINDOW` (default 60) submissions within `QUERY_RATE_WINDOW_SECONDS` (default 60) → `429` with a `Retry-After` header, before a job is created. Limits are independent per key. |
+| F-16 | `POST /query` accepts an optional `callback_url`. When the job reaches `done`/`failed`, the server POSTs the job object (with signed `download_urls`) to that URL, HMAC-signed via `X-Webhook-Signature` (same secret as download URLs), retried up to `CALLBACK_MAX_ATTEMPTS` with backoff, off the query worker threads. Cancelled jobs don't notify. |
+| F-16a | `callback_url` is SSRF-guarded: it must be plain `http(s)` to a publicly-routable host. URLs that are non-http(s) or resolve to private/loopback/link-local/reserved/metadata addresses are rejected with `400` at submit and re-validated before each delivery attempt (DNS-rebinding defence); redirects are not followed. `CALLBACK_ALLOW_PRIVATE=1` disables the guard for local development only. |
 
 ### 3.5 Job Lifecycle
 

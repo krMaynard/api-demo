@@ -90,7 +90,8 @@ Requests are structured (see `QueryRequest`/`compile_query` in `main.py`):
   `items_requested`, `removed_legal`, `removed_policy`, `not_found`,
   `not_enough_info`, `no_action`, `already_removed`.
 - **Aggregates**: `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a measure, with an alias.
-- `group_by`, `sort`, `max_count`. `GET /fields` documents all of this.
+- `group_by`, `sort`, `max_count`, optional `callback_url` (webhook). `GET /fields`
+  documents the query fields.
 
 `compile_query` is the single trust boundary — keep all field/operation
 validation there, and never build SQL by interpolating user values (always
@@ -130,6 +131,16 @@ bind with `?`).
   middleware logs each request (method/path/status/`duration_ms`/`request_id`,
   echoed as `X-Request-ID`); the job runner logs `job_submitted`/`job_started`/
   `job_done`/`job_failed`. Pass fields via `extra={"data": {...}}`; never log keys.
+- **Webhook callbacks**: an optional `callback_url` on `POST /query`. When the
+  job reaches `done`/`failed`, `_dispatch_callback` POSTs the job object (with
+  absolute links if `PUBLIC_BASE_URL` is set) to that URL on a **bounded callback
+  thread pool** (`_callback_executor`, `CALLBACK_WORKERS`) — off the query
+  workers — HMAC-signed (`X-Webhook-Signature`, same secret as download URLs),
+  retried with backoff. SSRF-guarded: `_validate_callback_url` blocks non-http(s)
+  and private/loopback/link-local/metadata targets, **unwrapping IPv4-mapped/6to4
+  IPv6** so they can't smuggle a private v4; enforced at submit *and* before each
+  send (narrows DNS rebinding — full closure needs network egress filtering);
+  redirects aren't followed. `CALLBACK_ALLOW_PRIVATE=1` bypasses for local dev.
 - **Prometheus metrics** at `GET /metrics` (no auth): the same request middleware
   records `api_demo_http_requests_total` + `_http_request_duration_seconds`,
   labelled by the **route template** (`/jobs/{job_id}`) to bound cardinality; the
@@ -167,7 +178,7 @@ code-review comments** (`gemini-code-assist[bot]`) using the GitHub MCP tools:
 | GET | `/fields` | key | Queryable fields + operations |
 | GET | `/tables` | key | List tables |
 | GET | `/schema/{table}` | key | Column info |
-| POST | `/query` | key | Submit structured query → 202 + job_id |
+| POST | `/query` | key | Submit structured query (optional `callback_url`) → 202 + job_id |
 | GET | `/jobs` | key | List your jobs |
 | GET | `/jobs/{id}` | key | Job status |
 | GET | `/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |

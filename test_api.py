@@ -652,3 +652,110 @@ class TestMetrics:
         # inc on submit / dec on pickup should net to zero once the job is done.
         _submit_and_wait(COUNT_ALL)
         assert REGISTRY.get_sample_value("api_demo_job_queue_depth") == 0.0
+
+
+# ── Webhook callbacks ───────────────────────────────────────────────────────────
+
+class TestCallbacks:
+    def test_bad_scheme_rejected_at_submit(self):
+        r = client.post(
+            "/query", json={**COUNT_ALL, "callback_url": "ftp://example.com/hook"}, headers=ALICE
+        )
+        assert r.status_code == 400
+
+    def test_missing_host_rejected_at_submit(self):
+        r = client.post(
+            "/query", json={**COUNT_ALL, "callback_url": "http:///nohost"}, headers=ALICE
+        )
+        assert r.status_code == 400
+
+    def test_ssrf_guard_blocks_private_targets(self):
+        import main
+
+        original = main.CALLBACK_ALLOW_PRIVATE
+        main.CALLBACK_ALLOW_PRIVATE = False  # exercise the guard regardless of env
+        try:
+            for bad in (
+                "http://127.0.0.1/x",           # loopback
+                "http://169.254.169.254/x",     # cloud metadata (link-local)
+                "http://10.1.2.3/x",            # private
+                "http://[::1]/x",               # ipv6 loopback
+                "http://[::ffff:127.0.0.1]/x",  # ipv4-mapped ipv6 loopback (bypass attempt)
+            ):
+                with pytest.raises(main.CallbackUrlError):
+                    main._validate_callback_url(bad)
+            # A public literal IP (no DNS needed) passes.
+            main._validate_callback_url("http://8.8.8.8/ok")
+        finally:
+            main.CALLBACK_ALLOW_PRIVATE = original
+
+    def test_end_to_end_delivery_is_signed(self):
+        import hashlib
+        import hmac
+        import http.server
+        import threading
+
+        import main
+        from prometheus_client import REGISTRY
+
+        captured: list[dict] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                captured.append({"headers": dict(self.headers), "body": self.rfile.read(n)})
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        delivered_before = REGISTRY.get_sample_value(
+            "api_demo_callbacks_total", {"result": "delivered"}
+        ) or 0.0
+        try:
+            cb = f"http://127.0.0.1:{server.server_port}/hook"
+            job = _submit_and_wait({**COUNT_ALL, "callback_url": cb})
+            deadline = time.monotonic() + 5
+            while not captured and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert captured, "callback was never delivered"
+        finally:
+            server.shutdown()
+
+        rec = captured[0]
+        payload = json.loads(rec["body"])
+        assert payload["event"] == "job.done"
+        assert payload["job"]["job_id"] == job["job_id"]
+        assert payload["job"]["download_urls"]["json"]  # present on a done job
+        expected = "sha256=" + hmac.new(
+            main.DOWNLOAD_URL_SECRET.encode(), rec["body"], hashlib.sha256
+        ).hexdigest()
+        assert rec["headers"].get("X-Webhook-Signature") == expected
+
+        after = REGISTRY.get_sample_value("api_demo_callbacks_total", {"result": "delivered"})
+        assert after is not None and after >= delivered_before + 1
+
+    def test_unreachable_target_records_failure(self):
+        import main
+        from prometheus_client import REGISTRY
+
+        original = main.CALLBACK_MAX_ATTEMPTS
+        main.CALLBACK_MAX_ATTEMPTS = 1  # fail fast, no backoff sleeps
+        before = REGISTRY.get_sample_value(
+            "api_demo_callbacks_total", {"result": "failed"}
+        ) or 0.0
+        try:
+            _submit_and_wait({**COUNT_ALL, "callback_url": "http://127.0.0.1:1/closed"})
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                now = REGISTRY.get_sample_value("api_demo_callbacks_total", {"result": "failed"})
+                if now is not None and now >= before + 1:
+                    break
+                time.sleep(0.05)
+            assert (REGISTRY.get_sample_value(
+                "api_demo_callbacks_total", {"result": "failed"}) or 0.0) >= before + 1
+        finally:
+            main.CALLBACK_MAX_ATTEMPTS = original
