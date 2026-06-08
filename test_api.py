@@ -947,6 +947,24 @@ class TestDashboard:
         assert r.status_code == 200 and "text/html" in r.headers["content-type"]
         assert "/api/overview" in r.text  # dashboard fetches the public overview
 
+    def test_dashboard_uses_vendored_chartjs(self):
+        r = client.get("/")
+        # Chart.js is self-hosted, not loaded from a CDN.
+        assert "/static/vendor/chart.umd.js" in r.text
+        assert "cdn.jsdelivr.net" not in r.text
+
+    def test_vendored_chartjs_served(self):
+        r = client.get("/static/vendor/chart.umd.js")
+        assert r.status_code == 200
+        assert "javascript" in r.headers["content-type"]
+        assert "immutable" in r.headers.get("cache-control", "")
+        assert "Chart.js v4.4.4" in r.text  # genuine vendored bundle
+
+    def test_unknown_vendor_asset_404(self):
+        # Only allowlisted filenames are served — no path traversal / arbitrary reads.
+        assert client.get("/static/vendor/secrets.js").status_code == 404
+        assert client.get("/static/vendor/..%2fmain.py").status_code in (404, 400)
+
 
 # ── Public interactive query (POST /api/explore) ─────────────────────────────
 
@@ -1097,7 +1115,9 @@ class TestCSP:
         r = client.get("/")
         csp = r.headers.get("Content-Security-Policy")
         assert csp and "default-src 'self'" in csp
-        assert "https://cdn.jsdelivr.net" in csp            # Chart.js CDN allowed
+        # Chart.js is vendored same-origin, so no third-party script origin is needed.
+        assert "cdn.jsdelivr.net" not in csp
+        assert "script-src 'self'" in csp
         assert "frame-ancestors 'none'" in csp and "object-src 'none'" in csp
         assert "'unsafe-inline'" not in csp.split("style-src")[0]  # no unsafe-inline for scripts
         # The inline-script hash is present, so a strict CSP won't break the page.

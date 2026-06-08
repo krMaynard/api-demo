@@ -1452,11 +1452,35 @@ def _serve_page(filename: str, label: str, **csp_hosts) -> FileResponse:
     return FileResponse(path, media_type="text/html", headers={"Content-Security-Policy": csp})
 
 
+# Third-party assets we vendor and serve ourselves (filename → media type).
+# Self-hosting Chart.js (instead of a CDN) keeps the dashboard working
+# air-gapped and lets its CSP stay `script-src 'self'` with no third-party
+# origin. Allowlisted by exact name so user input never builds a filesystem path.
+_VENDOR_ASSETS = {"chart.umd.js": "text/javascript"}
+
+
+@app.get("/static/vendor/{filename}")
+def vendored_asset(filename: str) -> FileResponse:
+    """Serve a vendored third-party asset (e.g. Chart.js) from static/vendor."""
+    media_type = _VENDOR_ASSETS.get(filename)
+    if media_type is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    path = os.path.join(STATIC_DIR, "vendor", filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    # Versioned, immutable content — let browsers/CDNs cache it for a year.
+    return FileResponse(
+        path, media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_page() -> FileResponse:
     """Serve the public VLOP transparency dashboard (reads GET /api/overview)."""
-    # Dashboard loads Chart.js from jsDelivr; all data calls are same-origin.
-    return _serve_page("index.html", "Dashboard page", script_hosts=["https://cdn.jsdelivr.net"])
+    # Chart.js is vendored same-origin (/static/vendor/chart.umd.js), so the CSP
+    # needs no third-party script origin — `script-src 'self'` + inline hashes.
+    return _serve_page("index.html", "Dashboard page")
 
 
 @app.get("/portal", response_class=HTMLResponse)

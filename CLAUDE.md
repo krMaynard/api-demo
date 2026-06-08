@@ -31,6 +31,7 @@ Built to demonstrate two things:
 | `data/vlop-dsa.json` | Vendored dataset snapshot — what the Docker image is seeded from (refresh via `scripts/refresh-dataset.sh`) |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
 | `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js overview + interactive query builder + NL "Ask" box (`GET /api/overview`, `POST /api/explore`, `POST /api/ask`) |
+| `static/vendor/chart.umd.js` | Vendored Chart.js 4.4.4 (self-hosted, not a CDN) — served by the `/static/vendor/{filename}` route so the dashboard CSP stays `script-src 'self'` |
 | `static/portal.html` | Researcher portal single-page app (served at `/portal`) — Google sign-in + demo fallback |
 | `Dockerfile` | Self-contained image: installs deps, seeds `demo.db` at build time, runs uvicorn on `$PORT` as non-root |
 | `service.yaml` | Cloud Run (Knative) manifest — prod env + startup/liveness probes |
@@ -209,9 +210,14 @@ Never build SQL by interpolating user values (always bind with `?`).
   (request middleware); the two HTML pages (`/`, `/portal`) get a per-page
   **Content-Security-Policy** (`_serve_page`/`_page_csp`) — `script-src 'self'` +
   the page's inline-`<script>` **sha256 hash** (computed from the file, never
-  stale) + the one CDN it needs (jsDelivr / `accounts.google.com`); no
+  stale); the dashboard needs no third-party script origin because **Chart.js is
+  vendored same-origin** (`static/vendor/chart.umd.js`, served by the
+  `/static/vendor/{filename}` route with a name allowlist + immutable caching),
+  and the portal only allows `accounts.google.com` for Google sign-in. No
   `'unsafe-inline'` for scripts, `frame-ancestors 'none'`. DB values are
-  HTML-escaped in the dashboard JS (`esc()`).
+  HTML-escaped in the dashboard JS (`esc()`). If Chart.js is unavailable, the
+  dashboard panels **fall back to data tables** instead of blank canvases
+  (`chartReady()`/`miniTable()`).
 
 ## Code Review Workflow
 

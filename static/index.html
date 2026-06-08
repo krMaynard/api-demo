@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>EU DSA VLOP Transparency Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+<script src="/static/vendor/chart.umd.js" defer></script>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #30363d;
@@ -108,12 +108,14 @@
     <h2>Article 16 notices by platform</h2>
     <p class="sub">Top platforms by total notices received (DSA Table 4).</p>
     <canvas id="chart-platforms" height="150"></canvas>
+    <div id="chart-platforms-fallback"></div>
   </section>
 
   <section class="card">
     <h2>Article 16 notices by category</h2>
     <p class="sub">Notices grouped by the category of allegedly illegal content.</p>
     <canvas id="chart-categories" height="150"></canvas>
+    <div id="chart-categories-fallback"></div>
   </section>
 
   <div class="error" id="error"></div>
@@ -185,10 +187,29 @@ function stat(num, lbl) {
   return `<div class="stat"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
 }
 
-function barChart(canvasId, labels, data, label) {
-  new Chart($(canvasId), {
+// Chart.js is vendored same-origin and loaded with `defer`, but it could still
+// be unavailable (asset blocked, offline). Everything that draws a chart checks
+// this and falls back to a plain data table so a panel never just goes blank.
+const chartReady = () => typeof window.Chart !== "undefined";
+
+function miniTable(labels, data, nameLabel, valueLabel) {
+  const rows = labels.map((l, i) =>
+    `<tr><td>${esc(l)}</td><td class="num">${fmt(data[i])}</td></tr>`).join("");
+  return `<table class="restable"><tr><th>${esc(nameLabel)}</th>` +
+         `<th class="num">${esc(valueLabel)}</th></tr>${rows}</table>`;
+}
+
+function barChart(canvasId, fallbackId, labels, data, nameLabel, valueLabel) {
+  const canvas = $(canvasId), fallback = $(fallbackId);
+  if (!chartReady()) {
+    canvas.style.display = "none";
+    fallback.innerHTML = miniTable(labels, data, nameLabel, valueLabel);
+    return;
+  }
+  fallback.innerHTML = "";
+  new Chart(canvas, {
     type: "bar",
-    data: { labels, datasets: [{ label, data, backgroundColor: "#58a6ff", borderRadius: 4 }] },
+    data: { labels, datasets: [{ label: valueLabel, data, backgroundColor: "#58a6ff", borderRadius: 4 }] },
     options: {
       indexAxis: "y",
       plugins: { legend: { display: false } },
@@ -217,11 +238,12 @@ async function load() {
     stat(fmt(d.platforms), "Parent platforms") +
     stat(fmt(d.total_notices), "Art. 16 notices");
 
-  // Chart.js is loaded with `defer`, so it's guaranteed ready by DOMContentLoaded.
   const tp = d.top_platforms || [];
-  barChart("#chart-platforms", tp.map(x => x.platform), tp.map(x => x.notices), "Notices");
+  barChart("#chart-platforms", "#chart-platforms-fallback",
+           tp.map(x => x.platform), tp.map(x => x.notices), "Platform", "Notices");
   const bc = d.by_category || [];
-  barChart("#chart-categories", bc.map(x => x.category), bc.map(x => x.notices), "Notices");
+  barChart("#chart-categories", "#chart-categories-fallback",
+           bc.map(x => x.category), bc.map(x => x.notices), "Category", "Notices");
 }
 
 // ── Interactive query builder (POST /api/explore) ────────────────────────────
@@ -279,15 +301,20 @@ async function runExplore() {
   const values = d.rows.map(r => r[1]);
   const legend = `${q.aggregates[0].function} ${q.aggregates[0].field_name}`;
   if (exChart) exChart.destroy();
-  exChart = new Chart($("#ex-chart"), {
-    type: "bar",
-    data: { labels, datasets: [{ label: legend, data: values, backgroundColor: "#3fb950", borderRadius: 4 }] },
-    options: {
-      indexAxis: "y", plugins: { legend: { display: false } },
-      scales: { x: { ticks: { color: "#9aa7b4" }, grid: { color: "#30363d" } },
-                y: { ticks: { color: "#e6edf3" }, grid: { display: false } } },
-    },
-  });
+  if (chartReady()) {
+    $("#ex-chart").style.display = "";
+    exChart = new Chart($("#ex-chart"), {
+      type: "bar",
+      data: { labels, datasets: [{ label: legend, data: values, backgroundColor: "#3fb950", borderRadius: 4 }] },
+      options: {
+        indexAxis: "y", plugins: { legend: { display: false } },
+        scales: { x: { ticks: { color: "#9aa7b4" }, grid: { color: "#30363d" } },
+                  y: { ticks: { color: "#e6edf3" }, grid: { display: false } } },
+      },
+    });
+  } else {
+    $("#ex-chart").style.display = "none";  // the result table below still renders
+  }
   const head = `<tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>`;
   const body = d.rows.map(r =>
     `<tr>${r.map((v, i) => i === 0 ? `<td>${esc(v)}</td>` : `<td class="num">${fmt(v)}</td>`).join("")}</tr>`
@@ -319,7 +346,7 @@ let askChart = null;
 
 function renderRows(d, chartSel, outSel, legend) {
   const out = $(outSel);
-  if (d.columns.length === 2 && d.rows.length) {
+  if (d.columns.length === 2 && d.rows.length && chartReady()) {
     if (askChart && chartSel === "#ask-chart") askChart.destroy();
     const c = new Chart($(chartSel), {
       type: "bar",
