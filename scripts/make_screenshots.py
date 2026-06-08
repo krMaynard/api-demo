@@ -176,13 +176,18 @@ def _truncate(text: str, max_lines: int = ROWS - 4) -> str:
 def build_step6(renderer: Renderer, base: str) -> None:
     """Step 6 — Open terminal, ready to call the API."""
     prompt = f"{C_PROMPT}researcher@laptop{C_RESET}:{C_CYAN}~{C_RESET}$ "
+    # Use a realistic-looking production URL rather than the ephemeral localhost
+    display_url = "https://api.vlop-research.eu"
     body = (
-        f"{C_DIM}# DSA Transparency Research API{C_RESET}\n"
-        f"{C_DIM}# Base URL: {base}{C_RESET}\n"
-        f"{C_DIM}# API key obtained from the researcher portal{C_RESET}\n"
+        f"{C_DIM}# EU DSA VLOP Transparency Research API{C_RESET}\n"
         "\n"
-        f"{prompt}{C_CMD}export API_KEY=\"researcher-api-key-abc123\"{C_RESET}\n"
-        f"{prompt}{C_CMD}export BASE_URL=\"{base}\"{C_RESET}\n"
+        f"{C_DIM}# Set your credentials (key issued via the researcher portal){C_RESET}\n"
+        f"{prompt}{C_CMD}export BASE_URL=\"{display_url}\"{C_RESET}\n"
+        f"{prompt}{C_CMD}export API_KEY=\"rk_live_abc123xyz\"{C_RESET}\n"
+        "\n"
+        f"{C_DIM}# Verify the key works{C_RESET}\n"
+        f"{prompt}{C_CMD}curl -s ${{BASE_URL}}/api/tables \\\n"
+        f"  -H \"X-API-Key: ${{API_KEY}}\" | python3 -m json.tool{C_RESET}\n"
         "\n"
         f"{prompt}"
     )
@@ -191,26 +196,35 @@ def build_step6(renderer: Renderer, base: str) -> None:
 
 def build_step7(renderer: Renderer, base: str, job: dict) -> None:
     """Step 7 — POST /api/query with API key."""
-    query_json = _fmt_json({
-        "table": "t4_notices",
-        "query": {"and": [
-            {"operation": "EQ", "field_name": "category_code", "field_values": ["TOTAL"]}
-        ]},
-        "group_by":   ["service_name"],
-        "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "notices"}],
-        "sort":       [{"field_name": "notices", "order": "desc"}],
-        "max_count":  10,
-    })
+    # Show the query body as a shell variable so the curl line itself stays short
+    query_lines = [
+        "{",
+        '  "table": "t4_notices",',
+        '  "query": {"and": [',
+        '    {"operation": "EQ", "field_name": "category_code",',
+        '     "field_values": ["TOTAL"]}',
+        '  ]},',
+        '  "group_by": ["service_name"],',
+        '  "aggregates": [{"function": "SUM", "field_name": "notices",',
+        '                  "alias": "notices"}],',
+        '  "sort": [{"field_name": "notices", "order": "desc"}],',
+        '  "max_count": 10',
+        "}",
+    ]
     prompt = f"{C_PROMPT}researcher@laptop{C_RESET}:{C_CYAN}~{C_RESET}$ "
-    cmd = (
-        f"curl -s -X POST ${{BASE_URL}}/api/query \\\n"
-        f"  -H \"X-API-Key: ${{API_KEY}}\" \\\n"
-        f"  -H \"Content-Type: application/json\" \\\n"
-        f"  -d '{query_json}'"
-    )
-    body = (
-        f"{prompt}{C_CMD}{cmd}{C_RESET}\n"
-    )
+    # Heredoc assignment then curl
+    lines = [f"{prompt}{C_CMD}read -r -d '' QUERY << 'EOF'"]
+    lines += [f"{C_CMD}{ln}" for ln in query_lines]
+    lines += [
+        f"EOF{C_RESET}",
+        "",
+        f"{prompt}{C_CMD}curl -s -X POST ${{BASE_URL}}/api/query \\",
+        f"  -H \"X-API-Key: ${{API_KEY}}\" \\",
+        f"  -H \"Content-Type: application/json\" \\",
+        f"  -d \"$QUERY\"{C_RESET}",
+        "",
+    ]
+    body = "\n".join(lines)
     _save(renderer, body, OUT_DIR / "step-07-post-query.png")
 
 
