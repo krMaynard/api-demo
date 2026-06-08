@@ -1906,7 +1906,11 @@ def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -
 
     try:
         claims = _verify_id_token(body.credential)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "google_auth_verify_failed",
+            extra={"data": {"error": str(exc), "error_type": type(exc).__name__}},
+        )
         raise HTTPException(status_code=401, detail="Invalid Google credential.")
 
     email = str(claims.get("email", "")).strip().lower()
