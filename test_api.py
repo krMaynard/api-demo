@@ -927,6 +927,36 @@ class TestVersion:
         r = client.get("/healthz")
         assert r.headers.get("X-Content-Type-Options") == "nosniff"
 
+    def test_security_hardening_headers_on_every_response(self):
+        r = client.get("/healthz")
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert "geolocation=()" in r.headers.get("Permissions-Policy", "")
+        assert "max-age=" in r.headers.get("Strict-Transport-Security", "")
+
+    def test_hardening_headers_present_on_500(self):
+        # An unhandled exception must not escape without the hardening headers:
+        # the middleware synthesises a 500 that still carries them.
+        import main
+
+        @main.app.get("/_boom_test")
+        def _boom():  # pragma: no cover - body raises before returning
+            raise RuntimeError("boom")
+
+        try:
+            local = TestClient(main.app, raise_server_exceptions=False)
+            r = local.get("/_boom_test")
+            assert r.status_code == 500
+            assert r.headers.get("X-Content-Type-Options") == "nosniff"
+            assert r.headers.get("Referrer-Policy") == "no-referrer"
+            assert r.headers.get("X-Frame-Options") == "DENY"
+            assert "max-age=" in r.headers.get("Strict-Transport-Security", "")
+        finally:
+            main.app.router.routes = [
+                rt for rt in main.app.router.routes
+                if getattr(rt, "path", None) != "/_boom_test"
+            ]
+
 
 # ── Combined site: dashboard + public overview ───────────────────────────────
 

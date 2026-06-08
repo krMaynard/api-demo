@@ -738,6 +738,29 @@ if _CORS_ORIGINS:
     )
 
 
+def _apply_response_headers(response: Response, request_id: str) -> Response:
+    """Stamp request-id/version + the security hardening headers on a response.
+
+    Factored out so it runs on *every* response — including the fallback 500 we
+    synthesise when a handler raises — never leaving an error response without
+    the hardening headers."""
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Version"] = APP_VERSION
+    # Security hardening headers on every response (defence in depth).
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # No `Referer` on outbound navigations — signed download URLs carry their
+    # HMAC in the query string, so never leak a full URL to a third-party site.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    # Belt-and-braces clickjacking defence alongside the pages' CSP
+    # `frame-ancestors 'none'` (covers pre-CSP browsers).
+    response.headers["X-Frame-Options"] = "DENY"
+    # Drop powerful browser features the app never uses.
+    response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=(), payment=()"
+    # Pin clients to HTTPS once seen (prod is TLS-terminated at the proxy).
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Emit one structured log line + Prometheus metrics per request."""
@@ -758,7 +781,10 @@ async def log_requests(request: Request, call_next):
                 "duration_ms": round((time.perf_counter() - start) * 1000, 2),
             }},
         )
-        raise
+        # Synthesise a generic 500 rather than re-raising, so an unhandled error
+        # still leaves with the hardening headers applied below (a bare
+        # propagated exception would bypass them).
+        response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
     finally:
         # Label by route template ("/jobs/{job_id}") to bound cardinality; bare
         # 404s (no matched route) collapse into "unmatched".
@@ -777,10 +803,7 @@ async def log_requests(request: Request, call_next):
             "duration_ms": round(elapsed * 1000, 2),
         }},
     )
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Version"] = APP_VERSION
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    return response
+    return _apply_response_headers(response, request_id)
 
 
 # ── Structured query model (TikTok-Research-API-style) ─────────────────────────

@@ -206,8 +206,11 @@ Never build SQL by interpolating user values (always bind with `?`).
   up — no reliance on `ThreadPoolExecutor` internals).
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
-- **Browser hardening**: every response gets `X-Content-Type-Options: nosniff`
-  (request middleware); the two HTML pages (`/`, `/portal`) get a per-page
+- **Browser hardening**: every response gets a set of hardening headers from the
+  request middleware — `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+  no-referrer` (so the HMAC in a signed download URL never leaks via `Referer`),
+  `X-Frame-Options: DENY`, `Permissions-Policy` (geolocation/camera/mic/payment
+  off), and `Strict-Transport-Security` (HSTS). The two HTML pages (`/`, `/portal`) get a per-page
   **Content-Security-Policy** (`_serve_page`/`_page_csp`) — `script-src 'self'` +
   the page's inline-`<script>` **sha256 hash** (computed from the file, never
   stale); the dashboard needs no third-party script origin because **Chart.js is
