@@ -1,214 +1,156 @@
-# Productionizing the SQL Query API
+# Going live with the DSA VLOP Transparency site + API
+
+The application is **code-complete for production**. Going live is now mostly
+*provisioning and configuration*, not engineering: stand up the infrastructure,
+wire the secrets, point a domain at it, and flip auth into production mode.
+
+This doc is the **go-live checklist and the decisions behind it**. The exact
+shell commands live in `README.md` → **Deploying** (Cloud Run, continuous
+deployment, custom domain) — this file deliberately doesn't duplicate them so
+they can't drift. Read this to know *what* has to happen and *why*; read the
+README to run it.
 
 ---
 
-## What's already done
+## What's already done (no code changes required)
 
-The codebase has been updated with the groundwork needed to deploy externally.
-The following items are **complete** — no further code changes required:
-
-| Item | What shipped |
+| Area | What shipped |
 |------|-------------|
-| Config from env vars | `DB_PATH`, `ROW_LIMIT`, `WORKER_THREADS`, `QUERY_TIMEOUT_SECONDS`, `REDIS_URL`, `JOB_TTL_SECONDS`, `API_KEYS_JSON` — all read from environment with safe defaults |
-| Persistent job storage | `RedisJobStore` used automatically when `REDIS_URL` is set; `MemoryJobStore` is the fallback for local dev |
-| Dockerfile | Python 3.12-slim, **seeds `demo.db` at build time** from the vendored snapshot, runs `uvicorn` on `$PORT` as a non-root user — self-contained, ready for any registry |
-| Cloud Run | `service.yaml` (Knative) with prod env (`ALLOW_DEMO_KEYS=0`, secrets) + startup/liveness probes; see README → "Deploy to Cloud Run" |
-| docker-compose | Wires web + Redis together (image self-seeds — no volume / pre-seed) |
-| Health endpoints | `GET /healthz` (liveness) and `GET /readyz` (checks DB connection) |
-| Smoke tests | 85 tests covering auth (incl. Google sign-in + admin approval), query lifecycle, job isolation, write rejection, CORS, and delete. Run with `pytest` — no Redis required |
-| seed.py data path | `--source` / `--db` flags (and `SEED_SOURCE_JSON` / `DB_PATH`) so seeding works outside the sibling-repo layout |
-| Authentication | **Google sign-in** (GIS/FedCM) with admin approval: `POST /auth/google` verifies ID tokens, new accounts await `ADMIN_EMAILS` approval, approved logins mint revocable session keys. Demo keys gated behind `ALLOW_DEMO_KEYS`. |
-| Portal key handling | Portal-issued keys (`/portal/register`) persist in Redis when configured (survive restarts, shared across workers), expire after `ISSUED_KEY_TTL_SECONDS`, are registration-rate-limited per IP/email, and are revocable via `DELETE /portal/key`. Disabled in production via `ALLOW_DEMO_KEYS=0`. |
-| `.env.example` | Documents every config variable |
+| Single combined site | Dashboard at `/`, JSON API under `/api/*`, portal at `/portal` — one origin, no CORS needed |
+| Config from env | Every knob reads from the environment with safe defaults (`.env.example` documents all of them) |
+| Authentication | **Google sign-in** (GIS/FedCM) → `POST /api/auth/google`, admin-approval gate (`ADMIN_EMAILS`), revocable session keys. Hard-coded demo keys + open `/api/portal/register` are gated behind `ALLOW_DEMO_KEYS` (turn off in prod) |
+| Persistent state | Redis-backed job / session / registration / issued-key stores when `REDIS_URL` is set; in-memory fallback for a single instance |
+| Self-contained image | Dockerfile seeds `demo.db` at build time from the vendored snapshot, runs uvicorn on `$PORT` as non-root — no external data source at runtime |
+| Cloud Run manifest | `service.yaml` (Knative) with prod env + startup/liveness probes |
+| Continuous deployment | `.github/workflows/deploy.yml` — build → push → deploy *no-traffic* revision → smoke-test `/readyz` → promote, via Workload Identity Federation. Skips cleanly until GCP is configured |
+| CI gate | `pyflakes` + `mypy` + 113 `pytest` tests on every PR/push (Python 3.11 & 3.12), hermetic — no Redis/server/DB needed |
+| Health & readiness | `GET /healthz` (liveness), `GET /readyz` (DB check), `GET /version` (commit SHA) |
+| Rate limiting | Per-key throttle on `POST /api/query`; per-IP limits on the public `/api/explore` and `/api/ask`; portal-registration limits — all `429` + `Retry-After` |
+| Structured logging | JSON logs by default, per-request `request_id` (`X-Request-ID`), job lifecycle events. Keys never logged |
+| Metrics | Prometheus at `GET /metrics` (request + job metrics, route-template labels) |
+| Secure downloads | HMAC-signed, key-less `download_urls` (`DOWNLOAD_URL_SECRET`) |
+| Webhook callbacks | Optional `callback_url`, HMAC-signed, retried, SSRF-guarded |
+| Browser hardening | Per-page CSP (`script-src 'self'` + inline-script hash), HSTS, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy`; Chart.js vendored same-origin |
+| Accessibility | Skip links, landmarks, focus rings, live regions, screen-reader data tables, `prefers-reduced-motion` |
 
 ---
 
-## How to deploy today
+## What you must do to go live
 
-### 1. Seed the database
+These are ordered. Run the exact commands from `README.md` → **Deploying**; the
+notes here are the decisions and the *why*.
 
-```bash
-# Default: reads from the sibling krMaynard.github.io repo
-python seed.py
+### 1. Pick a host
 
-# Or point at the JSON directly
-python seed.py --source /path/to/vlop-dsa.json --db demo.db
-```
+**Cloud Run is the wired-up path** — `service.yaml` + the CD workflow target it,
+so it's the lowest-effort route to a running, auto-deploying service. Railway /
+Fly.io / a VPS also work (see the table at the bottom); if you pick one of those
+you'll skip the GCP-specific steps but still do everything else below.
 
-### 2. Configure environment
+### 2. Provision the infrastructure
 
-```bash
-cp .env.example .env
-```
+- **GCP project + Artifact Registry repo** for the image (Cloud Run path).
+- **Redis** — required only if you'll run **more than one instance** (Cloud Run
+  `maxScale > 1`, or any horizontal scaling). With a single instance the
+  in-memory stores are fine, but jobs/sessions reset on every revision. Managed
+  options: Upstash (serverless, pay-per-request — matches `.env.example`) or GCP
+  Memorystore. Store the connection string as a secret, not an env literal.
 
-Edit `.env` — at minimum replace the `API_KEYS_JSON` value with real keys:
+### 3. Create the production secrets
 
-```
-API_KEYS_JSON={"sk-prod-abc123":{"name":"alice"},"sk-prod-def456":{"name":"bob"}}
-```
+- **`DOWNLOAD_URL_SECRET`** — a stable random value (`openssl rand -hex 32`).
+  Must be stable so signed download links survive restarts and validate across
+  instances. Put it in Secret Manager.
+- **`REDIS_URL`** — the connection string from step 2, in Secret Manager.
 
-### 3. Run with Docker Compose
+### 4. Set up Google sign-in (the production auth path)
 
-```bash
-# demo.db must exist first (step 1)
-docker-compose up --build
-```
+- Create an **OAuth 2.0 Web client ID** in the GCP console.
+- Add the Cloud Run URL (and later your custom domain) to the client's
+  **Authorized JavaScript origins**.
+- Set `GOOGLE_CLIENT_ID` to that client ID.
+- Set `ADMIN_EMAILS` to your address (comma-separated for several) — the first
+  admin is auto-approved and approves everyone else from `/portal`.
 
-The web service starts on port 8000 with Redis wired in automatically.
-Check `GET /readyz` to confirm the DB connection is live before sending traffic.
+### 5. Flip into production mode
 
-### 4. Put HTTPS in front of it
+In `service.yaml` (or your host's env):
 
-Never expose uvicorn directly on 443. Options:
+- `ALLOW_DEMO_KEYS=0` — disables the hard-coded `alice`/`bob` keys and the open
+  `/api/portal/register` endpoint, so **only Google sign-in works**.
+- `LOG_FORMAT=json`.
+- `PUBLIC_BASE_URL=https://<your-domain>` — makes callback/download links
+  absolute.
+- `ALLOWED_ORIGINS` — leave empty (the bundled portal is same-origin). Set it
+  only if a *separate* front-end origin will call the API cross-origin.
+- *(Optional)* `ANTHROPIC_API_KEY` — enables the natural-language "Ask" box
+  (`POST /api/ask`). The feature is off until this is set. It's IP-rate-limited
+  and goes through the same `compile_query` trust boundary as everything else.
 
-- **Caddy** (recommended for simplicity — automatic Let's Encrypt):
+### 6. First deploy, then wire continuous deployment
 
-  ```
-  api.yourdomain.com {
-      reverse_proxy web:8000
-  }
-  ```
+- Do the **first** deploy with `service.yaml` — it sets env/secrets/scaling/probes.
+- Then configure the CD workflow (Workload Identity pool + provider + deployer
+  service account + the `GCP_*` repo variables). After that, every push to
+  `main` ships a new revision and preserves the `service.yaml` config.
+- Make the service public (`run.invoker` → `allUsers`) — it's a public
+  transparency dashboard. Omit for an IAM-gated internal service (then the CD
+  smoke test needs an identity-token header).
 
-  Add a `caddy` service to `docker-compose.yml` and mount a `Caddyfile`.
+### 7. Map a custom domain
 
-- **AWS ALB / GCP Load Balancer**: terminate TLS at the load balancer, forward HTTP to the container.
+- Create the Cloud Run domain mapping and add the DNS records at your registrar.
+- **Add the domain to the OAuth client's Authorized JavaScript origins** (else
+  Google sign-in breaks on the real domain).
+- Update `PUBLIC_BASE_URL` to the custom domain.
+- The domain must be a real, registrable public TLD (`.org`, `.dev`, a
+  subdomain of one) — non-delegated names won't resolve.
 
-- **Railway / Fly.io**: HTTPS is automatic — they provision the cert. See [Deployment options](#deployment-options) below.
+### 8. Verify before announcing
 
-### 5. Use a real secret manager for API keys
-
-The `API_KEYS_JSON` env var is a stop-gap. In production, load keys from a secret store at startup and refresh on a schedule so keys can be rotated without a redeploy:
-
-```python
-# Example: AWS Secrets Manager
-import boto3, json
-
-def _load_api_keys():
-    secret = boto3.client("secretsmanager").get_secret_value(SecretId="api-demo/keys")
-    return json.loads(secret["SecretString"])
-```
-
-Each key record should carry: `owner_id`, `name`, `created_at`, `expires_at`, `scopes`, `last_used_at`.
+- `GET /readyz` returns 200 (DB opens).
+- `GET /version` shows the deployed commit SHA.
+- Sign in at `/portal` with an `ADMIN_EMAILS` account; approve a test account.
+- A demo key is rejected (confirms `ALLOW_DEMO_KEYS=0` took effect).
+- Submit a query end-to-end (`POST /api/query` → poll → result + signed download).
+- *(If on Cloud Run with `minScale: 0`)* expect a cold-start delay on the first
+  request; set `minScale: 1` if polling UX matters.
 
 ---
 
-## What's still left to do
+## Go-live checklist
 
-These are ordered by priority — stop when you've reached the level of hardening you need.
+- [ ] Host chosen (Cloud Run wired by default)
+- [ ] GCP project + Artifact Registry repo created
+- [ ] Redis provisioned (if running > 1 instance) and stored as a secret
+- [ ] `DOWNLOAD_URL_SECRET` generated and stored in Secret Manager
+- [ ] OAuth Web client created; Cloud Run URL added to Authorized origins
+- [ ] `GOOGLE_CLIENT_ID` + `ADMIN_EMAILS` set
+- [ ] `ALLOW_DEMO_KEYS=0`, `LOG_FORMAT=json`, `PUBLIC_BASE_URL` set
+- [ ] First deploy via `service.yaml` succeeded; `/readyz` green
+- [ ] CD workflow configured (WIF + repo variables); push-to-`main` deploys
+- [ ] Custom domain mapped; domain added to OAuth origins; `PUBLIC_BASE_URL` updated
+- [ ] Dataset snapshot current (`scripts/refresh-dataset.sh` if stale) and image rebuilt
+- [ ] End-to-end verification done (sign-in, approval, query, download)
 
-### Priority 1 — Before accepting external traffic
+---
 
-#### Rate limiting
+## Optional hardening — only when you need it
 
-`POST /query` is throttled per API key (`QUERY_RATE_MAX_PER_WINDOW` per
-`QUERY_RATE_WINDOW_SECONDS`, default 60/60s) using the same counter primitive as
-portal registration — over-limit requests get `429` + a `Retry-After` header
-before any job is spawned. The counter is Redis-backed when configured (shared
-across workers) and in-memory otherwise. For multi-endpoint or burst policies
-you may still want an edge limiter (nginx / Caddy / API Gateway) or `slowapi`.
+Everything above gets you live and safe for a public transparency dataset. The
+items below are genuinely *not* built; reach for them only when the load or
+threat model demands it.
 
-#### Structured logging
-
-JSON logs are emitted out of the box (`LOG_FORMAT=json`, the default; set
-`LOG_FORMAT=text` for human-readable lines). Each HTTP request logs method,
-path, status, `duration_ms`, and a `request_id` (also returned as the
-`X-Request-ID` response header); the job runner logs `job_submitted` /
-`job_started` / `job_done` / `job_failed` with `job_id`, row count, and
-`duration_ms`. API keys are never logged. Point your collector
-(CloudWatch / Datadog / Loki) at stdout.
-
-### Priority 2 — Once you have users
-
-#### Enable SQLite WAL mode (writable-DB deployments only)
-
-The connection is opened `mode=ro`, and the Cloud Run image bakes the DB in as
-a read-only, root-owned file (so a compromised app can't modify it). Concurrent
-**reads** already work fine in that setup — WAL is not needed and would not apply,
-since `mode=ro` never creates `-wal`/`-shm` files.
-
-WAL is only relevant if you switch to a **writable** database (e.g. a mounted
-volume rather than the baked image). In that case set it once after seeding, and
-make the DB directory writable by the runtime user:
-
-```bash
-# Run once after seeding, before starting the service
-sqlite3 demo.db "PRAGMA journal_mode=WAL;"
-```
-
-#### Query sandboxing
-
-The read-only connection already blocks writes. Add on top:
-
-- Per-key timeout (default 30 s; trusted keys get longer)
-- Query length cap (reject SQL > ~10 KB)
-- Pragma denylist (block `PRAGMA` statements that leak internal schema)
-
-#### Metrics
-
-Shipped: `GET /metrics` exposes Prometheus metrics via `prometheus-client`
-(no auth — scrape over an internal network). The request middleware records
-`api_demo_http_requests_total` and `api_demo_http_request_duration_seconds`
-labelled by the matched **route template** (so job ids don't explode label
-cardinality), and the job runner exposes `api_demo_jobs_in_flight`,
-`api_demo_jobs_total{status}`, and `api_demo_job_queue_depth`. Wire it into a
-Prometheus scrape config / Grafana dashboard; add alert rules on
-`job_queue_depth` and the `failed` job rate.
-
-#### Result offload for large payloads
-
-Results are buffered in Redis. For rows > ~1 MB serialized, write to S3/GCS and return a pre-signed URL instead:
-
-```
-job done
-  ├── result < 1 MB  →  Redis, served via /jobs/{id}/result as today
-  └── result ≥ 1 MB  →  S3 + pre-signed URL (expires 1 h)
-```
-
-### Priority 3 — At scale
-
-#### Horizontal worker scaling (Celery)
-
-The current `ThreadPoolExecutor` is in-process. To scale workers independently:
-
-```yaml
-# docker-compose addition
-worker:
-  build: .
-  command: celery -A tasks worker --concurrency 8
-  environment:
-    - REDIS_URL=redis://redis:6379/0
-```
-
-`_execute_job` maps cleanly onto a Celery task — swap `_executor.submit(...)` for `execute_job.delay(...)`.
-
-#### Result pagination
-
-```
-GET /jobs/{id}/result?format=json&limit=1000&after=<cursor>
-→ { rows: [...], next_cursor: "...", has_more: true }
-```
-
-#### Webhook callbacks
-
-Shipped: `POST /query` accepts an optional `callback_url`. When the job finishes
-the server POSTs the job object (with signed `download_urls`) to it, HMAC-signed
-(`X-Webhook-Signature`) and retried with backoff off the query workers, and
-SSRF-guarded against private/loopback/metadata targets (`CALLBACK_*` env vars).
-A production hardening step would move delivery onto a durable queue (so retries
-survive a restart), add per-caller allowlisting of callback domains, and put SSRF
-protection at the network layer (egress firewall / proxy). The app-level guard
-re-validates the host before each send, but a determined DNS-rebinding attacker
-can still race the resolver between check and connect — egress filtering closes
-that gap definitively.
-
-#### API versioning
-
-```python
-v1 = APIRouter(prefix="/v1")
-app.include_router(v1)
-```
-
-Deprecate old versions with a `Sunset` response header.
+| When | Do this |
+|------|---------|
+| You issue long-lived API keys and need rotation | Back `API_KEYS_JSON` with a secret store loaded at startup + refreshed on a schedule, with per-key `expires_at` / `scopes` / `last_used_at`. (With Google sign-in as the primary path this is lower priority.) |
+| Results regularly exceed ~1 MB | Offload large payloads to S3/GCS and return a pre-signed URL instead of buffering in Redis |
+| Query volume outgrows one process | Move the in-process `ThreadPoolExecutor` to Celery workers scaled independently (`_execute_job` maps cleanly onto a Celery task) |
+| Clients need to page large results | Add cursor pagination to `/api/jobs/{id}/result` (`limit` + `after`) |
+| Webhooks must survive restarts | Put callback delivery on a durable queue; add per-caller callback-domain allowlisting; enforce SSRF protection at the network egress layer (closes the DNS-rebind race the app-level guard can't) |
+| You need burst / multi-endpoint throttling | Add an edge limiter (Cloud Armor / API Gateway / nginx / `slowapi`) on top of the per-key limit |
+| The API contract will change | Introduce `/api/v1` routing and deprecate old versions with a `Sunset` header |
+| You switch to a **writable** DB (mounted volume, not the baked image) | Enable SQLite WAL (`PRAGMA journal_mode=WAL;`) once after seeding and make the DB dir writable. Not applicable to the default `mode=ro` baked image |
 
 ---
 
@@ -216,33 +158,13 @@ Deprecate old versions with a `Sunset` response header.
 
 | Option | Best for | Notes |
 |--------|----------|-------|
-| **Railway** | Fastest to ship | Push-to-deploy, managed Redis, free tier available |
-| **Fly.io** | Low-latency, multi-region | Built-in secrets, automatic HTTPS, good free tier |
+| **GCP Cloud Run** | The wired-up path | Ships with `service.yaml` + CD workflow + self-seeding image. Set `minScale: 1` to avoid cold starts on polling |
+| **Railway** | Fastest to ship elsewhere | Push-to-deploy, managed Redis add-on, automatic HTTPS |
+| **Fly.io** | Low-latency / multi-region | Built-in secrets, automatic HTTPS, `fly redis create` |
 | **AWS ECS + ElastiCache** | Existing AWS footprint | More ops overhead, more control |
-| **GCP Cloud Run** | Serverless | Ships with `service.yaml` + Dockerfile (self-seeding image). Set `minScale: 1` to avoid cold starts affecting polling UX |
-| **Hetzner VPS + Caddy** | Lowest cost, full control | Single server, fine until you need HA |
+| **Hetzner / VPS + Caddy** | Lowest cost, full control | Single server + Caddy for automatic Let's Encrypt TLS; fine until you need HA |
 
-**Railway** and **Fly.io** are the fastest paths: push the repo, set the env vars in their dashboard, provision a Redis add-on, and you have HTTPS + a domain in under an hour.
-
-#### Railway quickstart
-
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway add --plugin redis
-railway up
-# Set env vars in the Railway dashboard under Variables
-```
-
-#### Fly.io quickstart
-
-```bash
-brew install flyctl
-fly auth login
-fly launch          # detects Dockerfile automatically
-fly secrets set API_KEYS_JSON='{"sk-...":{"name":"alice"}}'
-fly redis create    # provision Redis, copy the URL
-fly secrets set REDIS_URL=redis://...
-fly deploy
-```
+For Railway/Fly.io: push the repo, set the same env vars from step 5 in their
+dashboard, provision a Redis add-on for `REDIS_URL`, and you get HTTPS + a domain
+without the GCP-specific setup. Never expose uvicorn directly on 443 — always
+terminate TLS at a proxy / load balancer / platform edge.
