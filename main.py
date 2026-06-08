@@ -1769,14 +1769,15 @@ def ask(body: AskRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     ask_query = _ask_cache_get(question)
     cached = ask_query is not None
-    if not cached:
+    # `if ask_query is None` (not `if not cached`) so the reassignment narrows the
+    # type for the rest of the function — no assert needed (assert is stripped by -O).
+    if ask_query is None:
         try:
             ask_query = _translate_question(question)  # LLM → constrained dict
         except Exception:
             logger.exception("nl_translate_failed")
             raise HTTPException(status_code=502, detail="The language model could not translate that question.")
         _ask_cache_put(question, ask_query)
-    assert ask_query is not None  # set from cache or translate above
     try:
         req = _askquery_to_request(ask_query)
         result = _run_query_bounded(req)
