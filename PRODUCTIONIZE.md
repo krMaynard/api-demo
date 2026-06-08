@@ -18,7 +18,7 @@ README to run it.
 |------|-------------|
 | Single combined site | Dashboard at `/`, JSON API under `/api/*`, portal at `/portal` — one origin, no CORS needed |
 | Config from env | Every knob reads from the environment with safe defaults (`.env.example` documents all of them) |
-| Authentication | **Google sign-in** (GIS/FedCM) → `POST /api/auth/google`, admin-approval gate (`ADMIN_EMAILS`), revocable session keys. Hard-coded demo keys + open `/portal/register` are gated behind `ALLOW_DEMO_KEYS` (turn off in prod) |
+| Authentication | **Google sign-in** (GIS/FedCM) → `POST /api/auth/google`, admin-approval gate (`ADMIN_EMAILS`), revocable session keys. Hard-coded demo keys + open `/api/portal/register` are gated behind `ALLOW_DEMO_KEYS` (turn off in prod) |
 | Persistent state | Redis-backed job / session / registration / issued-key stores when `REDIS_URL` is set; in-memory fallback for a single instance |
 | Self-contained image | Dockerfile seeds `demo.db` at build time from the vendored snapshot, runs uvicorn on `$PORT` as non-root — no external data source at runtime |
 | Cloud Run manifest | `service.yaml` (Knative) with prod env + startup/liveness probes |
@@ -77,7 +77,7 @@ you'll skip the GCP-specific steps but still do everything else below.
 In `service.yaml` (or your host's env):
 
 - `ALLOW_DEMO_KEYS=0` — disables the hard-coded `alice`/`bob` keys and the open
-  `/portal/register` form, so **only Google sign-in works**.
+  `/api/portal/register` endpoint, so **only Google sign-in works**.
 - `LOG_FORMAT=json`.
 - `PUBLIC_BASE_URL=https://<your-domain>` — makes callback/download links
   absolute.
