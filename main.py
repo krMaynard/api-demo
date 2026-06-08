@@ -779,7 +779,18 @@ async def log_requests(request: Request, call_next):
     )
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Version"] = APP_VERSION
+    # Security hardening headers on every response (defence in depth).
     response.headers["X-Content-Type-Options"] = "nosniff"
+    # No `Referer` on outbound navigations — signed download URLs carry their
+    # HMAC in the query string, so never leak a full URL to a third-party site.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    # Belt-and-braces clickjacking defence alongside the pages' CSP
+    # `frame-ancestors 'none'` (covers pre-CSP browsers).
+    response.headers["X-Frame-Options"] = "DENY"
+    # Drop powerful browser features the app never uses.
+    response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=(), payment=()"
+    # Pin clients to HTTPS once seen (prod is TLS-terminated at the proxy).
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 

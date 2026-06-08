@@ -723,8 +723,12 @@ make portal-gifs                        # → docs/gifs/portal-*.gif
   `DOWNLOAD_URL_TTL_SECONDS`. The signature is verified before any store lookup,
   so invalid signatures get a uniform `403` and can't probe which job ids exist.
   Set `DOWNLOAD_URL_SECRET` in production.
-- **Browser hardening.** Every response carries `X-Content-Type-Options: nosniff`,
-  and the two HTML pages (`/`, `/portal`) send a **Content-Security-Policy** that
+- **Browser hardening.** Every response carries a set of hardening headers —
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (signed
+  download URLs carry their HMAC in the query string, so the full URL is never
+  leaked via `Referer`), `X-Frame-Options: DENY`, `Permissions-Policy`
+  (geolocation/camera/mic/payment off), and `Strict-Transport-Security` (HSTS).
+  The two HTML pages (`/`, `/portal`) send a **Content-Security-Policy** that
   locks `script-src` to `'self'` plus each page's own inline `<script>` (allowlisted
   by sha256 hash — computed from the file, so never stale). Chart.js is **vendored
   same-origin** (`static/vendor/chart.umd.js`), so the dashboard needs no

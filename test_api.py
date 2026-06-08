@@ -927,6 +927,13 @@ class TestVersion:
         r = client.get("/healthz")
         assert r.headers.get("X-Content-Type-Options") == "nosniff"
 
+    def test_security_hardening_headers_on_every_response(self):
+        r = client.get("/healthz")
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert "geolocation=()" in r.headers.get("Permissions-Policy", "")
+        assert "max-age=" in r.headers.get("Strict-Transport-Security", "")
+
 
 # ── Combined site: dashboard + public overview ───────────────────────────────
 
