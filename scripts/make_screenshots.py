@@ -216,16 +216,16 @@ def build_step7(renderer: Renderer, base: str, job: dict) -> None:
 
 def build_step8(renderer: Renderer, base: str, job: dict) -> None:
     """Step 8 — 202 response with job_id + presigned download URLs."""
-    # Build a representative response (use real job_id / urls from the live call)
+    # Mirror the actual to_public() shape; resolve relative URLs to absolute.
     resp = {
-        "job_id":     job["job_id"],
-        "status":     "queued",
-        "table":      "t4_notices",
-        "submitted_at": job.get("submitted_at", "2026-06-08T12:00:00Z"),
-        "links": {
-            "status": f"{base}/api/jobs/{job['job_id']}",
-            "result": f"{base}/api/jobs/{job['job_id']}/result",
-        },
+        "job_id":       job["job_id"],
+        "status":       job.get("status", "queued"),
+        "submitted_by": job.get("submitted_by"),
+        "submitted_at": job.get("submitted_at"),
+        "compiled_sql": job.get("compiled_sql"),
+        "status_url":   base + job["status_url"] if job.get("status_url", "").startswith("/") else job.get("status_url"),
+        "result_url":   job.get("result_url"),
+        "download_urls": job.get("download_urls"),
     }
     resp_text = _fmt_json(resp)
     body = (
@@ -259,7 +259,13 @@ def build_step9(renderer: Renderer, base: str, done: dict) -> None:
 
 def build_step10(renderer: Renderer, base: str, done: dict) -> None:
     """Step 10 — open presigned download URL, receive data (no API key)."""
-    dl_url = done.get("download_urls", {}).get("json", f"{base}/api/jobs/{done['job_id']}/download?format=json&sig=...")
+    raw_dl = done.get("download_urls", {}).get("json", "")
+    if raw_dl.startswith("/"):
+        dl_url = base + raw_dl
+    elif raw_dl:
+        dl_url = raw_dl
+    else:
+        dl_url = f"{base}/api/jobs/{done['job_id']}/download?format=json&sig=..."
     prompt  = f"{C_PROMPT}researcher@laptop{C_RESET}:{C_CYAN}~{C_RESET}$ "
     # Fetch the actual download
     try:
@@ -309,6 +315,8 @@ def main() -> None:
 
         done = _poll(base, job_id, "alice")
         print(f"  job status:    {done['status']}")
+        if done.get("status") != "done":
+            raise RuntimeError(f"Job failed with status '{done.get('status')}': {done.get('error')}")
 
         print("\nRendering screenshots …")
         build_step6(renderer, base)
