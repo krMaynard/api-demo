@@ -218,6 +218,13 @@ Never build SQL by interpolating user values (always bind with `?`).
   HTML-escaped in the dashboard JS (`esc()`). If Chart.js is unavailable, the
   dashboard panels **fall back to data tables** instead of blank canvases
   (`chartReady()`/`miniTable()`).
+- **Accessibility**: both HTML pages have a skip-link → `<main id="main">`
+  landmark, a labelled `<nav>`, visible keyboard focus rings (`:focus-visible`),
+  `role="alert"` live regions for errors, and `aria-busy`/loading states while
+  data fetches. The chart `<canvas>` elements are `aria-hidden`; their data is
+  exposed to assistive tech via an always-rendered table that is `.sr-only`
+  (visually hidden) when the chart draws — so screen-reader users get the
+  numbers either way. Honours `prefers-reduced-motion`.
 
 ## Code Review Workflow
 

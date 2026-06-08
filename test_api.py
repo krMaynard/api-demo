@@ -1129,3 +1129,23 @@ class TestCSP:
         assert "script-src 'self'" in csp and "https://accounts.google.com" in csp
         assert "frame-src https://accounts.google.com" in csp  # GSI sign-in iframe
         assert self._inline_hash(r.text) in csp
+
+
+# ── Accessibility landmarks on the served HTML pages ─────────────────────────
+
+class TestAccessibility:
+    def test_dashboard_a11y_landmarks(self):
+        html = client.get("/").text
+        assert 'href="#main"' in html and 'class="skip-link"' in html  # skip link
+        assert 'id="main"' in html                                     # main landmark
+        assert 'aria-label="Primary"' in html                          # labelled nav
+        assert 'role="alert"' in html                                  # error live region
+        # Canvases carry an accessible table alternative, so hide them from AT.
+        assert 'id="chart-platforms" height="150" aria-hidden="true"' in html
+
+    def test_portal_a11y_landmarks(self):
+        html = client.get("/portal").text
+        assert 'href="#main"' in html and 'class="skip-link"' in html
+        assert 'id="main"' in html
+        assert 'role="alert"' in html
+        assert 'type="email"' in html and 'autocomplete="email"' in html
