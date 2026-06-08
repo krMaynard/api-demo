@@ -117,6 +117,12 @@ TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").lower() in ("1", "tru
 # Per-API-key throttle on query submission (the expensive, job-spawning path).
 QUERY_RATE_MAX = int(os.getenv("QUERY_RATE_MAX_PER_WINDOW", "60"))
 QUERY_RATE_WINDOW = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
+# Public interactive query path (POST /api/explore, no auth): runs the same
+# validated structured query inline, but hard-caps rows and is IP-rate-limited so
+# the unauthenticated endpoint can't be abused.
+EXPLORE_MAX_ROWS = int(os.getenv("EXPLORE_MAX_ROWS", "500"))
+EXPLORE_RATE_MAX = int(os.getenv("EXPLORE_RATE_MAX_PER_WINDOW", "60"))
+EXPLORE_RATE_WINDOW = int(os.getenv("EXPLORE_RATE_WINDOW_SECONDS", "60"))
 # Structured logging: JSON lines by default, or LOG_FORMAT=text for humans.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.getenv("LOG_FORMAT", "json").lower()
@@ -1288,10 +1294,12 @@ def root() -> dict[str, Any]:
         "period": meta.get("period"),
         "pattern": "async-job",
         "query_style": "TikTok-Research-API-style structured parameters (no SQL accepted); pick a `table` (GET /api/tables)",
-        "auth": "X-API-Key header required for the query API; public: `/`, `/api`, `/api/overview`, `/docs`, `/openapi.json`",
+        "auth": "X-API-Key header required for the job API; public: `/`, `/api`, `/api/overview`, `/api/explore`, `/docs`, `/openapi.json`",
         "endpoints": {
             "GET /": "Public VLOP transparency dashboard (web UI)",
             "GET /api/overview": "Public headline aggregates powering the dashboard (no auth)",
+            "GET /api/explore/options": "Public: tables + their dimensions/measures for the query builder",
+            "POST /api/explore": "Public: run a bounded structured query inline (no auth, row-capped, rate-limited)",
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
             "POST /api/auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key, or pending approval",
             "POST /api/portal/register": "Demo: issue an API key without auth (disabled when ALLOW_DEMO_KEYS=0)",
@@ -1458,6 +1466,54 @@ def overview() -> dict[str, Any]:
             if _overview_cache is None:
                 _overview_cache = _compute_overview()
     return _overview_cache
+
+
+@api_router.get("/explore/options")
+def explore_options() -> dict[str, Any]:
+    """Public metadata for the dashboard's query builder: each table's queryable
+    dimensions and measures, from the fixed registry (no DB, no secrets)."""
+    return {
+        "tables": [
+            {
+                "table": name,
+                "description": spec.description,
+                "dimensions": list(spec.dimensions),
+                "measures": list(spec.measures),
+            }
+            for name, spec in TABLES.items()
+        ],
+        "aggregates": ["SUM", "AVG", "MAX", "MIN", "COUNT"],
+        "max_rows": EXPLORE_MAX_ROWS,
+    }
+
+
+@api_router.post("/explore")
+def explore(body: QueryRequest, request: Request) -> dict[str, Any]:
+    """Public, synchronous, bounded query for the interactive dashboard.
+
+    Same validated structured-query model as POST /api/query (no SQL is ever
+    accepted; every field/operation is checked against the table registry and all
+    values are bound), but it runs inline and hard-caps the row count — no auth,
+    no job, no webhook. IP-rate-limited so the open endpoint can't be hammered."""
+    if _key_store.incr(f"explore:{_client_ip(request)}", EXPLORE_RATE_WINDOW) > EXPLORE_RATE_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many queries from here. Please slow down.",
+            headers={"Retry-After": str(EXPLORE_RATE_WINDOW)},
+        )
+    # Force the public row cap and drop any webhook regardless of what was sent.
+    capped = min(body.max_count, EXPLORE_MAX_ROWS)
+    safe = body.model_copy(update={"max_count": capped, "callback_url": None})
+    try:
+        sql, params, columns = compile_query(safe)
+    except QueryCompileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    conn = _connect_ro()
+    try:
+        rows = [list(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+    return {"columns": columns, "rows": rows, "row_count": len(rows)}
 
 
 @api_router.post("/portal/register", status_code=201)

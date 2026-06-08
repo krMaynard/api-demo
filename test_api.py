@@ -946,3 +946,45 @@ class TestDashboard:
         r = client.get("/")
         assert r.status_code == 200 and "text/html" in r.headers["content-type"]
         assert "/api/overview" in r.text  # dashboard fetches the public overview
+
+
+# ── Public interactive query (POST /api/explore) ─────────────────────────────
+
+class TestExplore:
+    def test_options_public(self):
+        r = client.get("/api/explore/options")  # no key
+        assert r.status_code == 200
+        d = r.json()
+        assert d["max_rows"] > 0 and "SUM" in d["aggregates"]
+        t4 = next(t for t in d["tables"] if t["table"] == "t4_notices")
+        assert "platform" in t4["dimensions"] and "notices" in t4["measures"]
+
+    def test_explore_aggregated_query_public(self):
+        q = {"table": "t4_notices", "group_by": ["platform"],
+             "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "value"}],
+             "sort": [{"field_name": "value", "order": "desc"}], "max_count": 5}
+        r = client.post("/api/explore", json=q)  # no key
+        assert r.status_code == 200
+        d = r.json()
+        assert d["columns"] == ["platform", "value"]
+        assert 0 < len(d["rows"]) <= 5
+        vals = [row[1] for row in d["rows"]]
+        assert vals == sorted(vals, reverse=True)  # sorted desc
+
+    def test_explore_caps_rows(self):
+        r = client.post("/api/explore", json={"table": "t4_notices",
+                                              "fields": ["service_name", "notices"],
+                                              "max_count": 100000})
+        assert r.status_code == 200
+        assert r.json()["row_count"] <= 500
+
+    def test_explore_rejects_invalid_table(self):
+        assert client.post("/api/explore", json={"table": "nope", "group_by": ["platform"]}).status_code == 400
+
+    def test_explore_ignores_callback_url(self):
+        # callback_url is stripped — no SSRF surface, query still runs.
+        r = client.post("/api/explore", json={
+            "table": "t4_notices", "group_by": ["platform"],
+            "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "value"}],
+            "max_count": 3, "callback_url": "http://169.254.169.254/latest/meta-data"})
+        assert r.status_code == 200

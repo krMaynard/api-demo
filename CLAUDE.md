@@ -30,7 +30,7 @@ Built to demonstrate two things:
 | `seed.py` | Build `demo.db` from a `vlop-dsa.json` (`--source`/`SEED_SOURCE_JSON`; default = sibling repo) — `build_db()` is reused by `conftest.py` |
 | `data/vlop-dsa.json` | Vendored dataset snapshot — what the Docker image is seeded from (refresh via `scripts/refresh-dataset.sh`) |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
-| `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js, reads `GET /api/overview` |
+| `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js overview + interactive query builder (`GET /api/overview`, `POST /api/explore`) |
 | `static/portal.html` | Researcher portal single-page app (served at `/portal`) — Google sign-in + demo fallback |
 | `Dockerfile` | Self-contained image: installs deps, seeds `demo.db` at build time, runs uvicorn on `$PORT` as non-root |
 | `service.yaml` | Cloud Run (Knative) manifest — prod env + startup/liveness probes |
@@ -226,6 +226,8 @@ root. The API endpoints are registered on an `APIRouter` included with
 |--------|------|------|-------|
 | GET | `/` | — | Public VLOP transparency dashboard (web UI) |
 | GET | `/api/overview` | — | Public headline aggregates powering the dashboard |
+| GET | `/api/explore/options` | — | Public: tables + dimensions/measures for the query builder |
+| POST | `/api/explore` | — | Public: run a bounded structured query inline (row-capped, IP-rate-limited) |
 | GET | `/api` | — | API service info |
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
 | POST | `/api/auth/google` | — | Verify a Google ID token → session key, or `202` pending approval |

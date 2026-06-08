@@ -306,6 +306,8 @@ origin (no CORS). Operational endpoints and pages stay at the root.
 |--------|-------------------------------------|------|------------------------------------------------|
 | GET    | `/`                                 | —    | Public VLOP transparency **dashboard** (web UI) |
 | GET    | `/api/overview`                     | —    | Public headline aggregates powering the dashboard |
+| GET    | `/api/explore/options`              | —    | Public: tables + their dimensions/measures (query-builder metadata) |
+| POST   | `/api/explore`                      | —    | Public: run a bounded structured query **inline** (row-capped, IP-rate-limited) |
 | GET    | `/api`                              | —    | API service info                               |
 | GET    | `/portal`                           | —    | Researcher portal (web UI)                      |
 | POST   | `/api/auth/google`                  | —    | Verify a Google ID token → session key, or `202` pending approval |
@@ -502,6 +504,9 @@ All tuneable values are read from environment variables at startup:
 | `TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` for the client IP (set only behind a trusted proxy) |
 | `QUERY_RATE_MAX_PER_WINDOW` | `60` | Max `POST /api/query` submissions per API key per window |
 | `QUERY_RATE_WINDOW_SECONDS` | `60` | Query rate-limit window |
+| `EXPLORE_MAX_ROWS` | `500` | Hard row cap for the public `POST /api/explore` endpoint |
+| `EXPLORE_RATE_MAX_PER_WINDOW` | `60` | Max public `/api/explore` queries per IP per window |
+| `EXPLORE_RATE_WINDOW_SECONDS` | `60` | Public explore rate-limit window |
 | `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
 | `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |
 | `PUBLIC_BASE_URL` | _(unset — relative links)_ | Base URL to make callback payload links absolute |
