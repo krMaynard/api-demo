@@ -153,7 +153,7 @@
       <button id="ask-run" type="button">Ask</button>
     </div>
     <div class="chips" id="ask-chips"></div>
-    <div class="error" id="ask-error" role="alert" aria-live="polite"></div>
+    <div class="error" id="ask-error" role="alert"></div>
     <p class="explain" id="ask-explain"></p>
     <canvas id="ask-chart" height="150" aria-hidden="true"></canvas>
     <div id="ask-out" aria-live="polite"></div>
@@ -179,7 +179,7 @@
       </select></label>
       <button id="ex-run" type="button">Run query</button>
     </div>
-    <div class="error" id="ex-error" role="alert" aria-live="polite"></div>
+    <div class="error" id="ex-error" role="alert"></div>
     <canvas id="ex-chart" height="150" aria-hidden="true"></canvas>
     <div id="ex-out" aria-live="polite"></div>
     <div class="resactions hidden" id="ex-actions">
@@ -513,7 +513,14 @@ async function setupAsk() {
   $("#ask-json-dl").addEventListener("click", () => lastAsk && downloadBlob("vlop-ask.json", JSON.stringify(lastAsk, null, 2), "application/json"));
 }
 
-document.addEventListener("DOMContentLoaded", () => { load(); setupExplore(); setupAsk(); });
+document.addEventListener("DOMContentLoaded", () => {
+  // Respect prefers-reduced-motion for Chart.js canvas animations too (the CSS
+  // rule only covers CSS transitions). One global default covers every chart.
+  if (chartReady() && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    Chart.defaults.animation = false;
+  }
+  load(); setupExplore(); setupAsk();
+});
 </script>
 </body>
 </html>
