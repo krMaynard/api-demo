@@ -1082,3 +1082,30 @@ def test_askquery_to_request_maps_count_star():
     })
     assert req.aggregates[0].field_name == "*"  # COUNT (rows) → COUNT(*)
     assert req.table == "t11_qualitative"
+
+
+# ── Content-Security-Policy on the served HTML pages ─────────────────────────
+
+class TestCSP:
+    def _inline_hash(self, html):
+        import re, hashlib, base64
+        blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+        assert blocks, "expected an inline <script> block"
+        return "'sha256-" + base64.b64encode(hashlib.sha256(blocks[0].encode()).digest()).decode() + "'"
+
+    def test_dashboard_csp(self):
+        r = client.get("/")
+        csp = r.headers.get("Content-Security-Policy")
+        assert csp and "default-src 'self'" in csp
+        assert "https://cdn.jsdelivr.net" in csp            # Chart.js CDN allowed
+        assert "frame-ancestors 'none'" in csp and "object-src 'none'" in csp
+        assert "'unsafe-inline'" not in csp.split("style-src")[0]  # no unsafe-inline for scripts
+        # The inline-script hash is present, so a strict CSP won't break the page.
+        assert self._inline_hash(r.text) in csp
+
+    def test_portal_csp(self):
+        r = client.get("/portal")
+        csp = r.headers.get("Content-Security-Policy")
+        assert "script-src 'self'" in csp and "https://accounts.google.com" in csp
+        assert "frame-src https://accounts.google.com" in csp  # GSI sign-in iframe
+        assert self._inline_hash(r.text) in csp

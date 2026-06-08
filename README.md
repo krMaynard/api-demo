@@ -723,6 +723,13 @@ make portal-gifs                        # → docs/gifs/portal-*.gif
   `DOWNLOAD_URL_TTL_SECONDS`. The signature is verified before any store lookup,
   so invalid signatures get a uniform `403` and can't probe which job ids exist.
   Set `DOWNLOAD_URL_SECRET` in production.
+- **Browser hardening.** Every response carries `X-Content-Type-Options: nosniff`,
+  and the two HTML pages (`/`, `/portal`) send a **Content-Security-Policy** that
+  locks `script-src` to `'self'`, each page's own inline `<script>` (allowlisted by
+  sha256 hash — computed from the file, so never stale), and the one CDN it needs
+  (jsDelivr for Chart.js; `accounts.google.com` for Google sign-in). No
+  `'unsafe-inline'` for scripts; `frame-ancestors 'none'` blocks clickjacking. DB
+  values are HTML-escaped before render.
 - When `REDIS_URL` is set, jobs and results persist across restarts and are
   shared across multiple processes. Without it, everything lives in memory
   and a restart clears all jobs.

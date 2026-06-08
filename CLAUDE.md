@@ -204,6 +204,13 @@ Never build SQL by interpolating user values (always bind with `?`).
   up — no reliance on `ThreadPoolExecutor` internals).
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.
+- **Browser hardening**: every response gets `X-Content-Type-Options: nosniff`
+  (request middleware); the two HTML pages (`/`, `/portal`) get a per-page
+  **Content-Security-Policy** (`_serve_page`/`_page_csp`) — `script-src 'self'` +
+  the page's inline-`<script>` **sha256 hash** (computed from the file, never
+  stale) + the one CDN it needs (jsDelivr / `accounts.google.com`); no
+  `'unsafe-inline'` for scripts, `frame-ancestors 'none'`. DB values are
+  HTML-escaped in the dashboard JS (`esc()`).
 
 ## Code Review Workflow
 

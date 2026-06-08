@@ -37,6 +37,7 @@ Configuration (environment variables):
     CALLBACK_WORKERS          size of the bounded webhook delivery pool (default: 8)
     CALLBACK_ALLOW_PRIVATE    allow callbacks to private/loopback hosts — dev only (default: off)
 """
+import base64
 import csv
 import hashlib
 import hmac
@@ -45,6 +46,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sqlite3
@@ -1406,22 +1408,68 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# Content-Security-Policy for the served HTML pages. Inline <script> blocks are
+# allowlisted by sha256 hash (computed from the file, so never stale) rather than
+# 'unsafe-inline', which keeps script injection locked down. Inline styles use
+# 'unsafe-inline' (lower risk, and Chart.js/GSI set element styles). CSPs are
+# cached per file since the static files don't change at runtime.
+_csp_cache: dict[str, str] = {}
+
+
+def _page_csp(html: str, *, script_hosts=(), connect_hosts=(), frame_hosts=(), img_hosts=()) -> str:
+    inline = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+    hashes = [
+        f"'sha256-{base64.b64encode(hashlib.sha256(s.encode()).digest()).decode()}'"
+        for s in inline
+    ]
+    directives = [
+        "default-src 'self'",
+        " ".join(["script-src", "'self'", *hashes, *script_hosts]),
+        "style-src 'self' 'unsafe-inline'",
+        " ".join(["img-src", "'self'", "data:", *img_hosts]),
+        " ".join(["connect-src", "'self'", *connect_hosts]),
+        " ".join(["frame-src", *(frame_hosts or ["'none'"])]),
+        "object-src 'none'",
+        "base-uri 'self'",
+        "frame-ancestors 'none'",
+    ]
+    return "; ".join(directives)
+
+
+def _serve_page(filename: str, label: str, **csp_hosts) -> FileResponse:
+    path = os.path.join(STATIC_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"{label} not found.")
+    csp = _csp_cache.get(filename)
+    if csp is None:
+        # Read raw bytes (not text mode) so the hash is over exactly what
+        # FileResponse streams — text-mode newline translation (CRLF→LF) would
+        # otherwise produce a hash that doesn't match the served bytes on a
+        # CRLF checkout (Windows / git autocrlf), silently breaking the page.
+        with open(path, "rb") as f:
+            csp = _page_csp(f.read().decode("utf-8"), **csp_hosts)
+        _csp_cache[filename] = csp
+    return FileResponse(path, media_type="text/html", headers={"Content-Security-Policy": csp})
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_page() -> FileResponse:
     """Serve the public VLOP transparency dashboard (reads GET /api/overview)."""
-    path = os.path.join(STATIC_DIR, "index.html")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Dashboard page not found.")
-    return FileResponse(path, media_type="text/html")
+    # Dashboard loads Chart.js from jsDelivr; all data calls are same-origin.
+    return _serve_page("index.html", "Dashboard page", script_hosts=["https://cdn.jsdelivr.net"])
 
 
 @app.get("/portal", response_class=HTMLResponse)
 def portal_page() -> FileResponse:
     """Serve the researcher portal single-page app."""
-    path = os.path.join(STATIC_DIR, "portal.html")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Portal page not found.")
-    return FileResponse(path, media_type="text/html")
+    # Portal loads Google Identity Services (script + sign-in iframe + avatar imgs).
+    return _serve_page(
+        "portal.html", "Portal page",
+        script_hosts=["https://accounts.google.com"],
+        connect_hosts=["https://accounts.google.com"],
+        frame_hosts=["https://accounts.google.com"],
+        img_hosts=["https://*.googleusercontent.com", "https://*.gstatic.com"],
+    )
 
 
 # The dashboard aggregates never change at runtime (the DB is opened mode=ro and
