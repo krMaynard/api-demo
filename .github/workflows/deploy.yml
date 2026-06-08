@@ -26,8 +26,8 @@ jobs:
     env:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION || 'us-central1' }}
-      SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'api-demo' }}
-      REPO: ${{ vars.ARTIFACT_REPO || 'api-demo' }}
+      SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'research-api' }}
+      REPO: ${{ vars.ARTIFACT_REPO || 'research-api' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
 
       - name: Build & push image (Cloud Build)
         run: |
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/api-demo"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/research-api"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           # Immutable, traceable tag = the commit SHA; also move :latest.
           gcloud builds submit --quiet --tag "${IMAGE}:${GITHUB_SHA}" .

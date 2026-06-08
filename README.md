@@ -1,6 +1,6 @@
-# api-demo
+# research-api
 
-[![CI](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/krMaynard/api-demo/actions/workflows/ci.yml)
+[![CI](https://github.com/krMaynard/research-api/actions/workflows/ci.yml/badge.svg)](https://github.com/krMaynard/research-api/actions/workflows/ci.yml)
 
 A FastAPI service that lets a researcher describe a query with **structured
 parameters** (no SQL), runs it asynchronously on a worker thread, and serves the
@@ -217,8 +217,8 @@ manager rather than using the demo fallback. See `PRODUCTIONIZE.md`.
 
 ```bash
 # 1. Install and seed
-git clone https://github.com/krMaynard/api-demo.git
-cd api-demo
+git clone https://github.com/krMaynard/research-api.git
+cd research-api
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -489,14 +489,14 @@ header so clients can correlate. The job runner logs `job_submitted` /
 network). Request metrics are labelled by the **matched route template**, so job
 ids never explode label cardinality:
 
-- `api_demo_http_requests_total{method, path, status}`
-- `api_demo_http_request_duration_seconds{method, path}` (histogram)
-- `api_demo_jobs_in_flight` / `api_demo_job_queue_depth` (gauges)
-- `api_demo_jobs_total{status}` (`done` / `failed`)
+- `research_api_http_requests_total{method, path, status}`
+- `research_api_http_request_duration_seconds{method, path}` (histogram)
+- `research_api_jobs_in_flight` / `research_api_job_queue_depth` (gauges)
+- `research_api_jobs_total{status}` (`done` / `failed`)
 
 ```
-api_demo_http_requests_total{method="GET",path="/api/jobs/{job_id}",status="200"} 1.0
-api_demo_jobs_total{status="done"} 1.0
+research_api_http_requests_total{method="GET",path="/api/jobs/{job_id}",status="200"} 1.0
+research_api_jobs_total{status="done"} 1.0
 ```
 
 ## Configuration
@@ -533,7 +533,7 @@ All tuneable values are read from environment variables at startup:
 | `ASK_RATE_MAX_PER_WINDOW` | `10` | Max public `/api/ask` (LLM) calls per IP per window |
 | `ASK_RATE_WINDOW_SECONDS` | `60` | Public ask rate-limit window |
 | `ASK_CACHE_SIZE` | `256` | In-process cache of question→query, so a repeat question skips the LLM call |
-| `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
+| `LOG_LEVEL` | `INFO` | Log level for the `research_api` logger |
 | `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |
 | `PUBLIC_BASE_URL` | _(unset — relative links)_ | Base URL to make callback payload links absolute |
 | `CALLBACK_TIMEOUT_SECONDS` | `10` | Per-attempt webhook delivery timeout |
@@ -570,16 +570,16 @@ probes) is included.
 PROJECT_ID=your-project; REGION=us-central1
 
 # 1. Build & push the image (Cloud Build → Artifact Registry)
-gcloud artifacts repositories create api-demo --repository-format=docker --location="$REGION" 2>/dev/null || true
-gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/api-demo/api-demo:latest"
+gcloud artifacts repositories create research-api --repository-format=docker --location="$REGION" 2>/dev/null || true
+gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/research-api/research-api:latest"
 
 # 2. Create the secrets it references
-printf '%s' "$(openssl rand -hex 32)" | gcloud secrets create api-demo-download-secret --data-file=- 2>/dev/null || true
-printf '%s' "redis://default:PASSWORD@HOST:6379" | gcloud secrets create api-demo-redis-url --data-file=- 2>/dev/null || true
+printf '%s' "$(openssl rand -hex 32)" | gcloud secrets create research-api-download-secret --data-file=- 2>/dev/null || true
+printf '%s' "redis://default:PASSWORD@HOST:6379" | gcloud secrets create research-api-redis-url --data-file=- 2>/dev/null || true
 
 # 3. Edit service.yaml — image, GOOGLE_CLIENT_ID, ADMIN_EMAILS, PUBLIC_BASE_URL — then deploy
 gcloud run services replace service.yaml --region "$REGION"
-gcloud run services add-iam-policy-binding api-demo --region "$REGION" \
+gcloud run services add-iam-policy-binding research-api --region "$REGION" \
   --member=allUsers --role=roles/run.invoker        # public; omit for IAM-gated
 ```
 
@@ -596,7 +596,7 @@ service-account keys). It **skips automatically** until you configure it, so it
 never red-Xes an un-provisioned repo. One-time setup:
 
 ```bash
-PROJECT_ID=your-project; REGION=us-central1; REPO=your-user/api-demo
+PROJECT_ID=your-project; REGION=us-central1; REPO=your-user/research-api
 SA=cloud-run-deployer@$PROJECT_ID.iam.gserviceaccount.com
 
 # 1. Deployer service account + roles (build, push, deploy, act-as runtime SA)
@@ -627,8 +627,8 @@ Then add these under **Settings → Secrets and variables → Actions → Variab
 |----------|-------|
 | `GCP_PROJECT_ID` | your project id (presence of this enables the workflow) |
 | `GCP_REGION` | e.g. `us-central1` (default if unset) |
-| `CLOUD_RUN_SERVICE` | e.g. `api-demo` (default if unset) |
-| `ARTIFACT_REPO` | Artifact Registry repo name (default `api-demo`) |
+| `CLOUD_RUN_SERVICE` | e.g. `research-api` (default if unset) |
+| `ARTIFACT_REPO` | Artifact Registry repo name (default `research-api`) |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/NUM/locations/global/workloadIdentityPools/github/providers/github` |
 | `GCP_SERVICE_ACCOUNT` | the deployer SA email above |
 | `DEPLOY` | optional — set to `false` to build & push only (no deploy) |
@@ -649,7 +649,7 @@ Map a domain to the service (or use Cloud Run's built-in domain mapping / a
 load balancer):
 
 ```bash
-gcloud beta run domain-mappings create --service api-demo \
+gcloud beta run domain-mappings create --service research-api \
   --domain api.example.com --region "$REGION" --project "$PROJECT_ID"
 # Then add the shown DNS records at your registrar.
 ```

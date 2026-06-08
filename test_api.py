@@ -574,7 +574,7 @@ class TestLogging:
 
         from main import JsonLogFormatter
 
-        rec = logging.LogRecord("api_demo", logging.INFO, __file__, 1, "job_done", None, None)
+        rec = logging.LogRecord("research_api", logging.INFO, __file__, 1, "job_done", None, None)
         rec.data = {"job_id": "abc", "rows": 5}
         line = json.loads(JsonLogFormatter().format(rec))
         assert line["event"] == "job_done"
@@ -592,7 +592,7 @@ class TestLogging:
             raise ValueError("boom")
         except ValueError:
             rec = logging.LogRecord(
-                "api_demo", logging.ERROR, __file__, 1, "request_error", None, sys.exc_info()
+                "research_api", logging.ERROR, __file__, 1, "request_error", None, sys.exc_info()
             )
         line = json.loads(JsonLogFormatter().format(rec))
         assert "boom" in line["exc"]
@@ -606,7 +606,7 @@ class TestLogging:
 
         from main import JsonLogFormatter
 
-        rec = logging.LogRecord("api_demo", logging.INFO, __file__, 1, "e", None, None)
+        rec = logging.LogRecord("research_api", logging.INFO, __file__, 1, "e", None, None)
         rec.created = 1577836800.0  # 2020-01-01T00:00:00Z
         line = json.loads(JsonLogFormatter().format(rec))
         assert line["ts"].startswith("2020-01-01T00:00:00")
@@ -664,11 +664,11 @@ class TestMetrics:
         body = r.text
         # Metric families are declared even before first use.
         for name in (
-            "api_demo_http_requests_total",
-            "api_demo_http_request_duration_seconds",
-            "api_demo_jobs_in_flight",
-            "api_demo_jobs_total",
-            "api_demo_job_queue_depth",
+            "research_api_http_requests_total",
+            "research_api_http_request_duration_seconds",
+            "research_api_jobs_in_flight",
+            "research_api_jobs_total",
+            "research_api_job_queue_depth",
         ):
             assert name in body
 
@@ -683,9 +683,9 @@ class TestMetrics:
     def test_job_completion_increments_jobs_total(self):
         from prometheus_client import REGISTRY
 
-        before = REGISTRY.get_sample_value("api_demo_jobs_total", {"status": "done"}) or 0.0
+        before = REGISTRY.get_sample_value("research_api_jobs_total", {"status": "done"}) or 0.0
         _submit_and_wait(COUNT_ALL)
-        after = REGISTRY.get_sample_value("api_demo_jobs_total", {"status": "done"})
+        after = REGISTRY.get_sample_value("research_api_jobs_total", {"status": "done"})
         assert after is not None and after >= before + 1
 
     def test_queue_depth_balances_to_zero_at_rest(self):
@@ -693,7 +693,7 @@ class TestMetrics:
 
         # inc on submit / dec on pickup should net to zero once the job is done.
         _submit_and_wait(COUNT_ALL)
-        assert REGISTRY.get_sample_value("api_demo_job_queue_depth") == 0.0
+        assert REGISTRY.get_sample_value("research_api_job_queue_depth") == 0.0
 
 
 # ── Webhook callbacks ───────────────────────────────────────────────────────────
@@ -755,7 +755,7 @@ class TestCallbacks:
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         delivered_before = REGISTRY.get_sample_value(
-            "api_demo_callbacks_total", {"result": "delivered"}
+            "research_api_callbacks_total", {"result": "delivered"}
         ) or 0.0
         try:
             cb = f"http://127.0.0.1:{server.server_port}/hook"
@@ -777,7 +777,7 @@ class TestCallbacks:
         ).hexdigest()
         assert rec["headers"].get("X-Webhook-Signature") == expected
 
-        after = REGISTRY.get_sample_value("api_demo_callbacks_total", {"result": "delivered"})
+        after = REGISTRY.get_sample_value("research_api_callbacks_total", {"result": "delivered"})
         assert after is not None and after >= delivered_before + 1
 
     def test_unreachable_target_records_failure(self):
@@ -787,18 +787,18 @@ class TestCallbacks:
         original = main.CALLBACK_MAX_ATTEMPTS
         main.CALLBACK_MAX_ATTEMPTS = 1  # fail fast, no backoff sleeps
         before = REGISTRY.get_sample_value(
-            "api_demo_callbacks_total", {"result": "failed"}
+            "research_api_callbacks_total", {"result": "failed"}
         ) or 0.0
         try:
             _submit_and_wait({**COUNT_ALL, "callback_url": "http://127.0.0.1:1/closed"})
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                now = REGISTRY.get_sample_value("api_demo_callbacks_total", {"result": "failed"})
+                now = REGISTRY.get_sample_value("research_api_callbacks_total", {"result": "failed"})
                 if now is not None and now >= before + 1:
                     break
                 time.sleep(0.05)
             assert (REGISTRY.get_sample_value(
-                "api_demo_callbacks_total", {"result": "failed"}) or 0.0) >= before + 1
+                "research_api_callbacks_total", {"result": "failed"}) or 0.0) >= before + 1
         finally:
             main.CALLBACK_MAX_ATTEMPTS = original
 

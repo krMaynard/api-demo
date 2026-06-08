@@ -29,7 +29,7 @@ Configuration (environment variables):
     DOWNLOAD_URL_TTL_SECONDS  how long a signed download URL stays valid (default: 3600)
     QUERY_RATE_MAX_PER_WINDOW  max POST /query submissions per API key per window (default: 60)
     QUERY_RATE_WINDOW_SECONDS  the query rate-limit window in seconds (default: 60)
-    LOG_LEVEL             log level for the api_demo logger (default: INFO)
+    LOG_LEVEL             log level for the research_api logger (default: INFO)
     LOG_FORMAT            json (default) for structured logs, or text for human-readable
     PUBLIC_BASE_URL       base URL used to make callback payload links absolute (default: relative)
     CALLBACK_TIMEOUT_SECONDS  per-attempt webhook timeout (default: 10)
@@ -177,7 +177,7 @@ def _configure_logging() -> logging.Logger:
         handler.setFormatter(JsonLogFormatter())
     else:
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log = logging.getLogger("api_demo")
+    log = logging.getLogger("research_api")
     log.handlers[:] = [handler]
     try:
         log.setLevel(LOG_LEVEL)
@@ -197,15 +197,15 @@ logger = _configure_logging()
 # not the raw path, so job ids don't blow up label cardinality.
 
 HTTP_REQUESTS = Counter(
-    "api_demo_http_requests_total", "HTTP requests", ["method", "path", "status"]
+    "research_api_http_requests_total", "HTTP requests", ["method", "path", "status"]
 )
 HTTP_LATENCY = Histogram(
-    "api_demo_http_request_duration_seconds", "HTTP request latency", ["method", "path"]
+    "research_api_http_request_duration_seconds", "HTTP request latency", ["method", "path"]
 )
-JOBS_IN_FLIGHT = Gauge("api_demo_jobs_in_flight", "Jobs currently executing")
-JOBS_TOTAL = Counter("api_demo_jobs_total", "Jobs by terminal status", ["status"])
-JOB_QUEUE_DEPTH = Gauge("api_demo_job_queue_depth", "Queued jobs not yet started")
-CALLBACKS_TOTAL = Counter("api_demo_callbacks_total", "Webhook callback deliveries", ["result"])
+JOBS_IN_FLIGHT = Gauge("research_api_jobs_in_flight", "Jobs currently executing")
+JOBS_TOTAL = Counter("research_api_jobs_total", "Jobs by terminal status", ["status"])
+JOB_QUEUE_DEPTH = Gauge("research_api_job_queue_depth", "Queued jobs not yet started")
+CALLBACKS_TOTAL = Counter("research_api_callbacks_total", "Webhook callback deliveries", ["result"])
 
 
 def _load_api_keys() -> dict[str, dict[str, str]]:
