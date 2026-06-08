@@ -1,4 +1,4 @@
-# api-demo — Claude context
+# research-api — Claude context
 
 ## What this is
 
@@ -75,7 +75,7 @@ uvicorn main:app --port 8000
 Repos are expected as siblings:
 ```
 parent/
-  api-demo/            ← this repo
+  research-api/            ← this repo
   krMaynard.github.io/ ← source data lives at data/vlop-dsa.json
 ```
 
@@ -183,7 +183,7 @@ Never build SQL by interpolating user values (always bind with `?`).
   (`QUERY_RATE_MAX`/`QUERY_RATE_WINDOW`, default 60/60s) via `_key_store.incr` —
   the same counter primitive as portal registration. Over-limit → `429` +
   `Retry-After`, before a job is created.
-- **Structured logging**: a dedicated `api_demo` logger emits JSON lines
+- **Structured logging**: a dedicated `research_api` logger emits JSON lines
   (`JsonLogFormatter`, `LOG_FORMAT=json` default; `text` for humans). An HTTP
   middleware logs each request (method/path/status/`duration_ms`/`request_id`,
   echoed as `X-Request-ID`); the job runner logs `job_submitted`/`job_started`/
@@ -199,10 +199,10 @@ Never build SQL by interpolating user values (always bind with `?`).
   send (narrows DNS rebinding — full closure needs network egress filtering);
   redirects aren't followed. `CALLBACK_ALLOW_PRIVATE=1` bypasses for local dev.
 - **Prometheus metrics** at `GET /metrics` (no auth): the same request middleware
-  records `api_demo_http_requests_total` + `_http_request_duration_seconds`,
+  records `research_api_http_requests_total` + `_http_request_duration_seconds`,
   labelled by the **route template** (`/jobs/{job_id}`) to bound cardinality; the
-  job runner tracks `api_demo_jobs_in_flight`, `api_demo_jobs_total{status}`, and
-  `api_demo_job_queue_depth` (inc'd on submit, dec'd when the worker picks the job
+  job runner tracks `research_api_jobs_in_flight`, `research_api_jobs_total{status}`, and
+  `research_api_job_queue_depth` (inc'd on submit, dec'd when the worker picks the job
   up — no reliance on `ThreadPoolExecutor` internals).
 - **Swagger UI** at `/docs` works out of the box — click Authorize and paste
   a key.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate showcase GIFs of the api-demo walkthrough — no ffmpeg/ttyd needed.
+"""Generate showcase GIFs of the research-api walkthrough — no ffmpeg/ttyd needed.
 
 What it does, end to end and fully headless:
 

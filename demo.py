@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Walkthrough of the api-demo structured-query API.
+Walkthrough of the research-api structured-query API.
 
 Start the server first (in a separate terminal):
     uvicorn main:app --port 8000
@@ -129,7 +129,7 @@ def _check_server() -> None:
 
 def main() -> None:
     mode = "pause mode — press Enter to advance" if PAUSE else "auto mode — use --pause for live demos"
-    print(f"\n{BOLD}api-demo walkthrough{RESET}  {DIM}({mode}){RESET}")
+    print(f"\n{BOLD}research-api walkthrough{RESET}  {DIM}({mode}){RESET}")
     print("=" * 60)
     _check_server()
 
