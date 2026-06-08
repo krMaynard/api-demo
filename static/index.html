@@ -48,6 +48,20 @@
   .card .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
   .error { color: #ff7b72; font-size: 14px; }
   .hidden { display: none !important; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 4px; }
+  .chip-btn {
+    background: var(--panel2); color: var(--accent); border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 12px; font-size: 12.5px; cursor: pointer; width: auto; margin: 0;
+  }
+  .chip-btn:hover { filter: brightness(1.15); }
+  .explain { color: var(--fg); font-size: 14px; margin: 10px 0 0; }
+  .explain .muted { color: var(--muted); }
+  .resactions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .ghost {
+    width: auto; margin: 0; background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .ghost:hover { filter: brightness(1.15); }
   .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 14px; }
   .controls label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 4px; }
   select {
@@ -109,14 +123,22 @@
     <p class="sub">An LLM turns your question into the <em>structured</em> query (never SQL),
       which runs through the same validated <code>/api/explore</code> path.</p>
     <div class="controls">
-      <input id="ask-q" type="text" placeholder="e.g. Which platforms received the most Article 16 notices?"
+      <input id="ask-q" type="text" aria-label="Ask a question about the data"
+             placeholder="e.g. Which platforms received the most Article 16 notices?"
              style="flex:1 1 320px; min-width:240px; background:var(--panel2); color:var(--fg);
                     border:1px solid var(--border); border-radius:8px; padding:9px 12px; font-size:14px;" />
       <button id="ask-run" type="button">Ask</button>
     </div>
-    <div class="error" id="ask-error"></div>
+    <div class="chips" id="ask-chips"></div>
+    <div class="error" id="ask-error" aria-live="polite"></div>
+    <p class="explain" id="ask-explain"></p>
     <canvas id="ask-chart" height="150"></canvas>
-    <div id="ask-out"></div>
+    <div id="ask-out" aria-live="polite"></div>
+    <div class="resactions hidden" id="ask-actions">
+      <button class="ghost" id="ask-refine" type="button">Refine in builder ↓</button>
+      <button class="ghost" id="ask-csv" type="button">Download CSV</button>
+      <button class="ghost" id="ask-json-dl" type="button">Download JSON</button>
+    </div>
     <details><summary>Generated query</summary><pre id="ask-json"></pre></details>
   </section>
 
@@ -134,9 +156,13 @@
       </select></label>
       <button id="ex-run" type="button">Run query</button>
     </div>
-    <div class="error" id="ex-error"></div>
+    <div class="error" id="ex-error" aria-live="polite"></div>
     <canvas id="ex-chart" height="150"></canvas>
-    <div id="ex-out"></div>
+    <div id="ex-out" aria-live="polite"></div>
+    <div class="resactions hidden" id="ex-actions">
+      <button class="ghost" id="ex-csv" type="button">Download CSV</button>
+      <button class="ghost" id="ex-json-dl" type="button">Download JSON</button>
+    </div>
     <details><summary>Request JSON (try it via the API)</summary><pre id="ex-json"></pre></details>
   </section>
 
@@ -266,7 +292,9 @@ async function runExplore() {
   const body = d.rows.map(r =>
     `<tr>${r.map((v, i) => i === 0 ? `<td>${esc(v)}</td>` : `<td class="num">${fmt(v)}</td>`).join("")}</tr>`
   ).join("");
-  $("#ex-out").innerHTML = d.rows.length ? `<table class="restable">${head}${body}</table>` : "";
+  $("#ex-out").innerHTML = (d.rows.length ? `<table class="restable">${head}${body}</table>` : "") + truncNote(d);
+  lastExplore = d;
+  $("#ex-actions").classList.toggle("hidden", !d.rows.length);
 }
 
 async function setupExplore() {
@@ -281,6 +309,8 @@ async function setupExplore() {
   onTableChange();
   $("#ex-table").addEventListener("change", () => { onTableChange(); runExplore(); });
   $("#ex-run").addEventListener("click", runExplore);
+  $("#ex-csv").addEventListener("click", () => lastExplore && downloadBlob("vlop-explore.csv", toCSV(lastExplore), "text/csv"));
+  $("#ex-json-dl").addEventListener("click", () => lastExplore && downloadBlob("vlop-explore.json", JSON.stringify(lastExplore, null, 2), "application/json"));
   runExplore();  // show an initial result
 }
 
@@ -310,10 +340,73 @@ function renderRows(d, chartSel, outSel, legend) {
   out.innerHTML = d.rows.length ? `<table class="restable">${head}${body}</table>` : "<p class='sub'>No rows.</p>";
 }
 
+// ── Shared: plain-English explanation, CSV/JSON export, truncation note ───────
+const AGG_WORDS = { SUM: "total", AVG: "average", MIN: "minimum", MAX: "maximum", COUNT: "count of" };
+let lastAsk = null, lastExplore = null;
+
+function explainQuery(aq, cached) {
+  if (!aq || !aq.table) return "";
+  const parts = [];
+  const agg = (aq.aggregates || [])[0];
+  const dim = (aq.group_by || [])[0];
+  if (agg) {
+    const what = agg.function === "COUNT" ? "number of rows" : `${AGG_WORDS[agg.function] || agg.function} ${agg.field_name || agg.field}`;
+    parts.push(`Showing the <strong>${esc(what)}</strong>${dim ? ` by <strong>${esc(dim)}</strong>` : ""}`);
+  } else {
+    parts.push("Showing matching rows");
+  }
+  const filters = (aq.filters || []).map(f =>
+    `${esc(f.field)} ${f.op === "IN" ? "in" : f.op.toLowerCase()} ${esc((f.values || []).join(", "))}`);
+  if (filters.length) parts.push(`where ${filters.join(" and ")}`);
+  parts.push(`<span class="muted">— from ${esc(aq.table)}, top ${esc(aq.max_count)}${cached ? " · cached" : ""}.</span>`);
+  return parts.join(" ");
+}
+
+function truncNote(d) {
+  return d.truncated ? `<p class="sub">Showing the first ${fmt(d.row_count)} rows (capped).</p>` : "";
+}
+
+function toCSV(d) {
+  const cell = (v) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  return [d.columns.map(cell).join(","), ...d.rows.map(r => r.map(cell).join(","))].join("\n");
+}
+
+function downloadBlob(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href);
+}
+
+function refineInBuilder(aq) {
+  const t = exOptions && exOptions.tables.find(x => x.table === aq.table);
+  if (!t) return;
+  $("#ex-table").value = aq.table; onTableChange();
+  const dim = (aq.group_by || [])[0];
+  if (dim && t.dimensions.includes(dim)) $("#ex-dim").value = dim;
+  const agg = (aq.aggregates || [])[0];
+  if (agg) {
+    const fn = agg.function, field = agg.field_name || agg.field;
+    if ([...$("#ex-agg").options].some(o => o.value === fn)) $("#ex-agg").value = fn;
+    if (!$("#ex-measure").disabled && field && t.measures.includes(field)) $("#ex-measure").value = field;
+  }
+  const top = String(aq.max_count);
+  if ([...$("#ex-top").options].some(o => o.value === top)) $("#ex-top").value = top;
+  runExplore();
+  document.getElementById("explore-card").scrollIntoView({ behavior: "smooth" });
+}
+
+const ASK_EXAMPLES = [
+  "Top platforms by Article 16 notices",
+  "Which services have the most monthly active users?",
+  "Notices by category for TikTok",
+  "Average automated actions per platform",
+];
+
 async function runAsk() {
   const q = $("#ask-q").value.trim();
   if (!q) return;
-  $("#ask-error").textContent = "";
+  $("#ask-error").textContent = ""; $("#ask-explain").innerHTML = "";
+  $("#ask-actions").classList.add("hidden");
   const btn = $("#ask-run"); btn.disabled = true; btn.textContent = "Asking…";
   try {
     const res = await fetch("/api/ask", {
@@ -325,9 +418,12 @@ async function runAsk() {
       if (d.detail && d.detail.generated) $("#ask-json").textContent = JSON.stringify(d.detail.generated, null, 2);
       throw new Error(msg);
     }
+    lastAsk = d;
     $("#ask-json").textContent = JSON.stringify(d.query, null, 2);
-    const legend = d.columns[1] || "value";
-    renderRows(d, "#ask-chart", "#ask-out", legend);
+    $("#ask-explain").innerHTML = explainQuery(d.query, d.cached);
+    renderRows(d, "#ask-chart", "#ask-out", d.columns[1] || "value");
+    $("#ask-out").insertAdjacentHTML("beforeend", truncNote(d));
+    if (d.rows.length) $("#ask-actions").classList.remove("hidden");
   } catch (err) {
     $("#ask-error").textContent = "" + err.message;
   } finally {
@@ -340,8 +436,15 @@ async function setupAsk() {
   try { cfg = await (await fetch("/api")).json(); } catch (_) { return; }
   if (!(cfg.features && cfg.features.nl_query)) return;  // feature off — leave hidden
   show($("#ask-card"));
+  $("#ask-chips").innerHTML = ASK_EXAMPLES.map(q => `<button class="chip-btn" type="button">${esc(q)}</button>`).join("");
+  [...$("#ask-chips").children].forEach((b, i) => b.addEventListener("click", () => {
+    $("#ask-q").value = ASK_EXAMPLES[i]; runAsk();
+  }));
   $("#ask-run").addEventListener("click", runAsk);
   $("#ask-q").addEventListener("keydown", (e) => { if (e.key === "Enter") runAsk(); });
+  $("#ask-refine").addEventListener("click", () => lastAsk && refineInBuilder(lastAsk.query));
+  $("#ask-csv").addEventListener("click", () => lastAsk && downloadBlob("vlop-ask.csv", toCSV(lastAsk), "text/csv"));
+  $("#ask-json-dl").addEventListener("click", () => lastAsk && downloadBlob("vlop-ask.json", JSON.stringify(lastAsk, null, 2), "application/json"));
 }
 
 document.addEventListener("DOMContentLoaded", () => { load(); setupExplore(); setupAsk(); });

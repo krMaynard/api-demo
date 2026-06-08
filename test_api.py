@@ -1008,6 +1008,7 @@ class TestAsk:
                 "max_count": 5,
             }
         import main
+        main._ask_cache.clear()  # no cross-test cache leakage
         monkeypatch.setattr(main, "_translate_question", fake_translate)
         yield
 
@@ -1051,6 +1052,25 @@ class TestAsk:
         import main
         monkeypatch.setattr(main, "NL_QUERY_ENABLED", False)
         assert client.post("/api/ask", json={"question": "x"}).status_code == 503
+
+    def test_ask_caches_translation(self, monkeypatch):
+        import main
+        calls = {"n": 0}
+        def counting(q):
+            calls["n"] += 1
+            return {"table": "t4_notices", "filters": [], "group_by": ["platform"],
+                    "aggregates": [{"function": "SUM", "field": "notices", "alias": "v"}],
+                    "sort": [{"field": "v", "order": "desc"}], "max_count": 3}
+        monkeypatch.setattr(main, "_translate_question", counting)
+        r1 = client.post("/api/ask", json={"question": "Top platforms?"})
+        r2 = client.post("/api/ask", json={"question": "  top   PLATFORMS? "})  # same, normalized
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert calls["n"] == 1  # second served from cache
+        assert r1.json()["cached"] is False and r2.json()["cached"] is True
+
+    def test_ask_reports_truncated(self):
+        r = client.post("/api/ask", json={"question": "top platforms by notices?"})
+        assert "truncated" in r.json()  # cap indicator present
 
 
 def test_askquery_to_request_maps_count_star():

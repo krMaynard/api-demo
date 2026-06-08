@@ -131,6 +131,8 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 NL_QUERY_ENABLED = bool(os.getenv("ANTHROPIC_API_KEY"))
 ASK_RATE_MAX = int(os.getenv("ASK_RATE_MAX_PER_WINDOW", "10"))
 ASK_RATE_WINDOW = int(os.getenv("ASK_RATE_WINDOW_SECONDS", "60"))
+# Cache translated questions in-process so a repeated question skips the LLM call.
+ASK_CACHE_SIZE = int(os.getenv("ASK_CACHE_SIZE", "256"))
 # Structured logging: JSON lines by default, or LOG_FORMAT=text for humans.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.getenv("LOG_FORMAT", "json").lower()
@@ -1586,6 +1588,30 @@ def _ask_system_prompt() -> str:
 _anthropic_client = None
 
 
+# Question → AskQuery cache. Translations are stable for a given question, so a
+# repeated question skips the (paid) LLM call. Insertion-ordered dict as a tiny LRU.
+_ask_cache: dict[str, dict[str, Any]] = {}
+_ask_cache_lock = threading.Lock()
+
+
+def _ask_cache_key(question: str) -> str:
+    return " ".join(question.lower().split())
+
+
+def _ask_cache_get(question: str) -> dict[str, Any] | None:
+    with _ask_cache_lock:
+        return _ask_cache.get(_ask_cache_key(question))
+
+
+def _ask_cache_put(question: str, value: dict[str, Any]) -> None:
+    with _ask_cache_lock:
+        key = _ask_cache_key(question)
+        _ask_cache.pop(key, None)
+        _ask_cache[key] = value
+        while len(_ask_cache) > ASK_CACHE_SIZE:
+            _ask_cache.pop(next(iter(_ask_cache)))  # evict oldest
+
+
 def _translate_question(question: str) -> dict[str, Any]:
     """Call Claude to turn a question into an AskQuery dict (constrained JSON).
     `anthropic` is imported lazily (only needed when the feature is enabled);
@@ -1644,7 +1670,8 @@ def _run_query_bounded(body: QueryRequest) -> dict[str, Any]:
         rows = [list(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
-    return {"columns": columns, "rows": rows, "row_count": len(rows)}
+    # `truncated` lets the UI flag that the public row cap was hit.
+    return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": len(rows) >= capped}
 
 
 @api_router.post("/explore")
@@ -1690,11 +1717,15 @@ def ask(body: AskRequest, request: Request) -> dict[str, Any]:
     question = body.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
-    try:
-        ask_query = _translate_question(question)  # LLM → constrained dict
-    except Exception:
-        logger.exception("nl_translate_failed")
-        raise HTTPException(status_code=502, detail="The language model could not translate that question.")
+    ask_query = _ask_cache_get(question)
+    cached = ask_query is not None
+    if not cached:
+        try:
+            ask_query = _translate_question(question)  # LLM → constrained dict
+        except Exception:
+            logger.exception("nl_translate_failed")
+            raise HTTPException(status_code=502, detail="The language model could not translate that question.")
+        _ask_cache_put(question, ask_query)
     try:
         req = _askquery_to_request(ask_query)
         result = _run_query_bounded(req)
@@ -1704,7 +1735,7 @@ def ask(body: AskRequest, request: Request) -> dict[str, Any]:
             status_code=422,
             detail={"error": f"Couldn't run that as a query: {exc}", "generated": ask_query},
         )
-    return {"question": question, "query": ask_query, **result}
+    return {"question": question, "query": ask_query, "cached": cached, **result}
 
 
 @api_router.post("/portal/register", status_code=201)

@@ -141,6 +141,10 @@ It's **off unless `ANTHROPIC_API_KEY` is set** (LLM calls cost money), more tigh
 IP-rate-limited than `/api/explore`, and the dashboard only shows the "Ask in plain
 English" box when the server reports the feature enabled. The translation call is
 isolated behind one function, so tests mock it and never hit the network.
+Repeated questions are served from an in-process cache (`ASK_CACHE_SIZE`) so they
+skip the LLM. The dashboard surfaces a plain-English restatement of the generated
+query, suggested-question chips, a "Refine in builder" hand-off, and CSV/JSON
+export of any result (explore + ask alike).
 
 ## Why an async job pattern?
 
@@ -528,6 +532,7 @@ All tuneable values are read from environment variables at startup:
 | `ANTHROPIC_MODEL` | `claude-opus-4-8` | Model used to translate questions into structured queries |
 | `ASK_RATE_MAX_PER_WINDOW` | `10` | Max public `/api/ask` (LLM) calls per IP per window |
 | `ASK_RATE_WINDOW_SECONDS` | `60` | Public ask rate-limit window |
+| `ASK_CACHE_SIZE` | `256` | In-process cache of question→query, so a repeat question skips the LLM call |
 | `LOG_LEVEL` | `INFO` | Log level for the `api_demo` logger |
 | `LOG_FORMAT` | `json` | `json` for structured logs, `text` for human-readable |
 | `PUBLIC_BASE_URL` | _(unset — relative links)_ | Base URL to make callback payload links absolute |
