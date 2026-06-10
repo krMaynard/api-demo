@@ -548,11 +548,11 @@ async function runAsk() {
       headers: { "Content-Type": "application/json", "X-API-Key": key },
       body: JSON.stringify({ question: q }),
     });
-    const d = await res.json();
     if (res.status === 401) {
       localStorage.removeItem("vlop_api_key"); askGate(true);
       throw new Error("Your session expired — sign in again at the portal.");
     }
+    const d = await res.json();
     if (!res.ok) {
       const msg = (d.detail && d.detail.error) || d.detail || `HTTP ${res.status}`;
       if (d.detail && d.detail.generated) $("#ask-json").textContent = JSON.stringify(d.detail.generated, null, 2);

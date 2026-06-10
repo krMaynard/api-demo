@@ -59,8 +59,10 @@ apply_env() {
     read -rp "    Admin email(s) for ADMIN_EMAILS (comma-separated): " ADMIN_EMAILS
     [[ -n "$ADMIN_EMAILS" ]] || die "ADMIN_EMAILS is required."
   fi
+  # Use a non-comma delimiter (^;^) so a comma-separated ADMIN_EMAILS list isn't
+  # mis-split by gcloud's dict parser. ';' appears in none of these values.
   g run services update "$SERVICE" --quiet \
-    --update-env-vars "PUBLIC_BASE_URL=https://${DOMAIN},GOOGLE_CLIENT_ID=${CLIENT_ID},ADMIN_EMAILS=${ADMIN_EMAILS}"
+    --update-env-vars "^;^PUBLIC_BASE_URL=https://${DOMAIN};GOOGLE_CLIENT_ID=${CLIENT_ID};ADMIN_EMAILS=${ADMIN_EMAILS}"
   ok "Set PUBLIC_BASE_URL=https://${DOMAIN}, GOOGLE_CLIENT_ID, ADMIN_EMAILS"
   local demo
   demo="$(g run services describe "$SERVICE" \
