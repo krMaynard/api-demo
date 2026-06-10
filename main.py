@@ -1473,7 +1473,14 @@ def _serve_page(filename: str, label: str, **csp_hosts) -> FileResponse:
         with open(path, "rb") as f:
             csp = _page_csp(f.read().decode("utf-8"), **csp_hosts)
         _csp_cache[filename] = csp
-    return FileResponse(path, media_type="text/html", headers={"Content-Security-Policy": csp})
+    # no-cache (not no-store): browsers may keep a copy but must revalidate, so a
+    # deploy is picked up immediately instead of serving a stale page. The CSP
+    # hash is tied to the exact bytes, so a stale HTML/CSP mismatch breaks pages.
+    return FileResponse(
+        path,
+        media_type="text/html",
+        headers={"Content-Security-Policy": csp, "Cache-Control": "no-cache"},
+    )
 
 
 # Third-party assets we vendor and serve ourselves (filename → media type).
