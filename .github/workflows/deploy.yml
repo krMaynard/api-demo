@@ -97,6 +97,7 @@ jobs:
         if: ${{ vars.DEPLOY != 'false' }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
           if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
             echo "ANTHROPIC_API_KEY repo secret not set — leaving /api/ask disabled."
@@ -107,7 +108,10 @@ jobs:
             || gcloud secrets create "$SECRET" --replication-policy=automatic --project "$PROJECT_ID"
           printf '%s' "$ANTHROPIC_API_KEY" \
             | gcloud secrets versions add "$SECRET" --data-file=- --project "$PROJECT_ID"
-          PROJNUM="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+          # Project number for the runtime (Compute default) SA, parsed from the
+          # WIF provider var — avoids gcloud projects describe, which needs the
+          # Cloud Resource Manager API (not enabled for the deployer SA).
+          PROJNUM="$(printf '%s' "$WIF_PROVIDER" | cut -d/ -f2)"
           gcloud secrets add-iam-policy-binding "$SECRET" \
             --member="serviceAccount:${PROJNUM}-compute@developer.gserviceaccount.com" \
             --role=roles/secretmanager.secretAccessor --project "$PROJECT_ID" >/dev/null || true
