@@ -180,24 +180,6 @@
   </nav>
 
  <main id="main" tabindex="-1">
-  <div class="stats" id="stats" aria-busy="true"><p class="loading">Loading headline figures…</p></div>
-
-  <section class="card">
-    <h2>Article 16 notices by platform</h2>
-    <p class="sub">Top platforms by total notices received (DSA Table 4).</p>
-    <canvas id="chart-platforms" height="150" aria-hidden="true"></canvas>
-    <div id="chart-platforms-fallback"><p class="loading">Loading chart…</p></div>
-  </section>
-
-  <section class="card">
-    <h2>Article 16 notices by category</h2>
-    <p class="sub">Notices grouped by the category of allegedly illegal content.</p>
-    <canvas id="chart-categories" height="150" aria-hidden="true"></canvas>
-    <div id="chart-categories-fallback"><p class="loading">Loading chart…</p></div>
-  </section>
-
-  <div class="error" id="error" role="alert"></div>
-
   <section class="card hidden" id="ask-card">
     <h2>Ask in plain English ✨</h2>
     <p class="sub">An LLM turns your question into the <em>structured</em> query (never SQL),
@@ -222,6 +204,24 @@
     </div>
     <details><summary>Generated query</summary><pre id="ask-json"></pre></details>
   </section>
+
+  <div class="stats" id="stats" aria-busy="true"><p class="loading">Loading headline figures…</p></div>
+
+  <section class="card">
+    <h2>Article 16 notices by platform</h2>
+    <p class="sub">Top platforms by total notices received (DSA Table 4).</p>
+    <canvas id="chart-platforms" height="150" aria-hidden="true"></canvas>
+    <div id="chart-platforms-fallback"><p class="loading">Loading chart…</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Article 16 notices by category</h2>
+    <p class="sub">Notices grouped by the category of allegedly illegal content.</p>
+    <canvas id="chart-categories" height="150" aria-hidden="true"></canvas>
+    <div id="chart-categories-fallback"><p class="loading">Loading chart…</p></div>
+  </section>
+
+  <div class="error" id="error" role="alert"></div>
 
   <section class="card" id="explore-card">
     <h2>Explore the data</h2>
