@@ -63,6 +63,13 @@
   }
   header h1 { margin: 0 0 6px; font-size: 26px; }
   header p { margin: 0; color: var(--muted); }
+  nav[aria-label="Primary"] { text-align: center; margin: 16px 0 26px; }
+  nav[aria-label="Primary"] a {
+    color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 600;
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; margin: 0 5px;
+    background: var(--panel); display: inline-block;
+  }
+  nav[aria-label="Primary"] a:hover { border-color: var(--accent); }
   .card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
     padding: 24px; margin: 0 0 20px; box-shadow: 0 8px 30px rgba(0,0,0,.25);
@@ -144,6 +151,12 @@
     <h1>Research Data Portal</h1>
     <p>EU DSA VLOP content-moderation transparency — request access and explore the schema.</p>
   </header>
+
+  <nav aria-label="Primary">
+    <a href="/">← Dashboard</a>
+    <a href="/docs">API docs</a>
+    <a href="/api">API info (JSON)</a>
+  </nav>
 
  <main id="main" tabindex="-1">
   <!-- Step 1: sign in -->
