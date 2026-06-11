@@ -902,15 +902,8 @@ class TestGoogleAuth:
     def _signin(self, email):
         return client.post("/api/auth/google", json={"credential": email})
 
-    def test_new_user_is_pending(self):
+    def test_new_user_is_approved_immediately(self):
         r = self._signin("newbie@example.com")
-        assert r.status_code == 202
-        body = r.json()
-        assert body["status"] == "pending"
-        assert "api_key" not in body
-
-    def test_admin_is_auto_approved(self):
-        r = self._signin("admin@example.com")
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "approved"
@@ -922,26 +915,25 @@ class TestGoogleAuth:
     def test_unverified_email_is_401(self):
         assert self._signin("unverified:x@example.com").status_code == 401
 
-    def test_approval_flow_issues_working_key(self):
-        assert self._signin("res@example.com").status_code == 202
-        admin_key = self._signin("admin@example.com").json()["api_key"]
-        appr = client.post("/api/admin/registrations/res@example.com/approve",
-                           headers={"X-API-Key": admin_key})
-        assert appr.status_code == 200 and appr.json()["status"] == "approved"
+    def test_legacy_pending_account_is_approved_on_signin(self):
+        # Accounts left `pending` from when admin review existed sign straight in.
+        import main
+        main._registrations.upsert("res@example.com", {
+            "email": "res@example.com", "name": "res", "status": "pending",
+            "requested_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "approved_by": None,
+        })
         r = self._signin("res@example.com")
         assert r.status_code == 200
         assert client.get("/api/tables", headers={"X-API-Key": r.json()["api_key"]}).status_code == 200
 
     def test_non_admin_cannot_reach_admin_endpoints(self):
-        admin_key = self._signin("admin@example.com").json()["api_key"]
-        client.post("/api/admin/registrations/u@example.com/approve", headers={"X-API-Key": admin_key})
         user_key = self._signin("u@example.com").json()["api_key"]
         assert client.get("/api/admin/registrations", headers={"X-API-Key": user_key}).status_code == 403
         assert client.get("/api/admin/registrations").status_code == 401
 
     def test_revoke_invalidates_live_session(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]
-        client.post("/api/admin/registrations/r3@example.com/approve", headers={"X-API-Key": admin_key})
         user_key = self._signin("r3@example.com").json()["api_key"]
         assert client.get("/api/tables", headers={"X-API-Key": user_key}).status_code == 200
         client.post("/api/admin/registrations/r3@example.com/revoke", headers={"X-API-Key": admin_key})
@@ -950,14 +942,27 @@ class TestGoogleAuth:
         # And a fresh sign-in is rejected as revoked.
         assert self._signin("r3@example.com").status_code == 403
 
+    def test_approve_restores_revoked_account(self):
+        admin_key = self._signin("admin@example.com").json()["api_key"]
+        self._signin("r4@example.com")
+        client.post("/api/admin/registrations/r4@example.com/revoke", headers={"X-API-Key": admin_key})
+        assert self._signin("r4@example.com").status_code == 403
+        appr = client.post("/api/admin/registrations/r4@example.com/approve",
+                           headers={"X-API-Key": admin_key})
+        assert appr.status_code == 200 and appr.json()["status"] == "approved"
+        r = self._signin("r4@example.com")
+        assert r.status_code == 200
+        assert client.get("/api/tables", headers={"X-API-Key": r.json()["api_key"]}).status_code == 200
+
     def test_list_registrations_filters_by_status(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]
         self._signin("p1@example.com")
         self._signin("p2@example.com")
-        body = client.get("/api/admin/registrations?status=pending",
+        client.post("/api/admin/registrations/p2@example.com/revoke", headers={"X-API-Key": admin_key})
+        body = client.get("/api/admin/registrations?status=revoked",
                           headers={"X-API-Key": admin_key}).json()
         emails = {r["email"] for r in body["registrations"]}
-        assert {"p1@example.com", "p2@example.com"} <= emails
+        assert emails == {"p2@example.com"}
 
     def test_cannot_revoke_admin(self):
         admin_key = self._signin("admin@example.com").json()["api_key"]

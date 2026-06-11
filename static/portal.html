@@ -167,7 +167,7 @@
     <!-- Google sign-in (shown when GOOGLE_CLIENT_ID is configured) -->
     <div id="google-block" class="hidden">
       <div class="gbtn" id="google-btn"></div>
-      <p class="hint">New accounts are reviewed by an administrator before access is granted.</p>
+      <p class="hint">Sign in with any Google account — your API key is issued immediately.</p>
     </div>
 
     <!-- Divider, shown only when both Google and key-based sign-in are available -->
@@ -182,13 +182,6 @@
       <button id="submit" type="submit">Request API key</button>
     </form>
     <div class="error" id="error" role="alert"></div>
-  </section>
-
-  <!-- Pending admin approval -->
-  <section class="card hidden" id="pending-card">
-    <h2>Request received ⏳</h2>
-    <p class="sub">Thanks, <span id="pending-who">researcher</span> — your access request is
-      awaiting administrator approval. Sign in again once it's been approved.</p>
   </section>
 
   <!-- Step 2: issued key -->
@@ -271,8 +264,7 @@ async function onAuthSuccess(data) {
 
 // ── Google sign-in ──────────────────────────────────────────────────────────
 // The GSI client library (FedCM-backed) hands us an ID token; we POST it to
-// /auth/google, which verifies it and either mints a session or queues the
-// account for admin approval.
+// /auth/google, which verifies it and mints a session for any verified account.
 async function onGoogleCredential(resp) {
   $("#error").textContent = "";
   try {
@@ -282,12 +274,6 @@ async function onGoogleCredential(resp) {
       body: JSON.stringify({ credential: resp.credential }),
     });
     const data = await r.json();
-    if (r.status === 202) {  // pending admin approval
-      $("#pending-who").textContent = data.email || "researcher";
-      $("#login-card").classList.add("hidden");
-      show($("#pending-card"));
-      return;
-    }
     if (!r.ok) throw new Error(data.detail || "Sign-in failed");
     await onAuthSuccess(data);
   } catch (err) {

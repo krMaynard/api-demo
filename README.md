@@ -58,10 +58,9 @@ in supporting browsers, with non-FedCM fallback elsewhere:
 
 - The frontend gets a Google **ID token** and POSTs it to `POST /api/auth/google`; the
   server verifies it (signature, `aud=GOOGLE_CLIENT_ID`, issuer, expiry, verified email).
-- A new account becomes a **`pending`** registration (`202`); an **admin** (`ADMIN_EMAILS`,
-  implicitly approved) approves it via `POST /api/admin/registrations/{email}/approve`.
-- An approved login mints a first-party **session key** (`gs_…`, TTL
-  `GOOGLE_SESSION_TTL_SECONDS`) used as `X-API-Key` like any other.
+- Any verified Google account is **approved automatically on first sign-in** — there is
+  no admin review step. A successful login mints a first-party **session key** (`gs_…`,
+  TTL `GOOGLE_SESSION_TTL_SECONDS`) used as `X-API-Key` like any other.
 - Sessions are **revocable**: `POST /api/admin/registrations/{email}/revoke` (or
   `DELETE /api/portal/key` to sign yourself out) takes effect on the next request, because
   Google sessions are re-checked against the registration each call.
@@ -331,11 +330,11 @@ origin (no CORS). Operational endpoints and pages stay at the root.
 | POST   | `/api/ask`                          | —    | Public: ask in natural language — an LLM writes the structured query (if `ANTHROPIC_API_KEY` set) |
 | GET    | `/api`                              | —    | API service info                               |
 | GET    | `/portal`                           | —    | Researcher portal (web UI)                      |
-| POST   | `/api/auth/google`                  | —    | Verify a Google ID token → session key, or `202` pending approval |
+| POST   | `/api/auth/google`                  | —    | Verify a Google ID token → session key (any verified account) |
 | POST   | `/api/portal/register`              | —    | Demo: issue a key without auth (disabled when `ALLOW_DEMO_KEYS=0`) |
 | DELETE | `/api/portal/key`                   | key  | Revoke your own session / portal-issued key    |
 | GET    | `/api/admin/registrations`          | admin| List researcher registrations (`?status=`)     |
-| POST   | `/api/admin/registrations/{email}/approve` | admin | Approve an account                  |
+| POST   | `/api/admin/registrations/{email}/approve` | admin | Restore a revoked account           |
 | POST   | `/api/admin/registrations/{email}/revoke`  | admin | Revoke an account (kills live sessions) |
 | GET    | `/healthz`                          | —    | Liveness probe                                 |
 | GET    | `/readyz`                           | —    | Readiness probe (checks DB connection)         |
@@ -513,7 +512,7 @@ All tuneable values are read from environment variables at startup:
 | `JOB_TTL_SECONDS` | `86400` | How long to retain jobs in Redis (24 h) |
 | `API_KEYS_JSON` | `alice` / `bob` demo keys | JSON object: `{"<key>": {"name": "<name>"}, …}` |
 | `GOOGLE_CLIENT_ID` | _(unset — sign-in disabled)_ | OAuth 2.0 Web client ID; the `aud` Google ID tokens are verified against |
-| `ADMIN_EMAILS` | _(empty)_ | Comma-separated admin allowlist — implicitly approved, can approve/revoke others |
+| `ADMIN_EMAILS` | _(empty)_ | Comma-separated admin allowlist — can revoke/restore other accounts |
 | `GOOGLE_SESSION_TTL_SECONDS` | `604800` | Lifetime of a first-party session minted after Google sign-in (7 days) |
 | `ALLOW_DEMO_KEYS` | `1` | Demo `alice`/`bob` keys + open `/api/portal/register`; set `0` in production |
 | `ALLOWED_ORIGINS` | _(empty — same-origin only)_ | Comma-separated browser origins allowed for cross-origin API calls (CORS) |
@@ -586,8 +585,8 @@ gcloud run services add-iam-policy-binding research-api --region "$REGION" \
 
 Then create an **OAuth 2.0 Web client ID** in Google Cloud and add the Cloud Run
 URL (and any custom domain) to its *Authorized JavaScript origins* — that's the
-value of `GOOGLE_CLIENT_ID`. Sign in at `/portal`; the first `ADMIN_EMAILS`
-account is auto-approved and can approve others.
+value of `GOOGLE_CLIENT_ID`. Sign in at `/portal` with any Google account — a key
+is issued immediately; `ADMIN_EMAILS` accounts can revoke (and restore) access.
 
 ### Continuous deployment (GitHub Actions)
 

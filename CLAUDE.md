@@ -93,13 +93,14 @@ Two mechanisms, both presented as `X-API-Key` to the rest of the app:
 - **Google sign-in (production).** The frontend uses Google Identity Services
   (FedCM in supporting browsers) to get an ID token and POSTs it to
   `/auth/google`. `_verify_id_token` validates it against `GOOGLE_CLIENT_ID`.
-  New accounts become a `pending` registration; an admin (`ADMIN_EMAILS`,
-  comma-separated, implicitly approved) approves via `/admin/registrations/*`.
-  An approved login mints a first-party **session key** (`gs_…`) into
-  `_key_store` (TTL `GOOGLE_SESSION_TTL`). `_lookup_principal` re-checks the
-  registration on every request, so an admin revoke kills live sessions at once.
-  Durable approval state lives in `_registrations` (Redis-backed when configured,
-  else in-memory — same pattern as `_key_store`).
+  Any verified Google account is **approved automatically on first sign-in**
+  (no admin review); a login mints a first-party **session key** (`gs_…`) into
+  `_key_store` (TTL `GOOGLE_SESSION_TTL`). Admins (`ADMIN_EMAILS`,
+  comma-separated) keep a kill switch via `/admin/registrations/*` (revoke /
+  restore). `_lookup_principal` re-checks the registration on every request, so
+  an admin revoke kills live sessions at once. Durable account state lives in
+  `_registrations` (Redis-backed when configured, else in-memory — same pattern
+  as `_key_store`).
 - **Demo keys (dev).** Hard-coded `alice`/`bob` + the open `/portal/register`.
   Gated by `ALLOW_DEMO_KEYS` (default on); set `ALLOW_DEMO_KEYS=0` in production.
 
@@ -274,11 +275,11 @@ root. The API endpoints are registered on an `APIRouter` included with
 | POST | `/api/ask` | — | Public: NL→query via an LLM (Claude) → structured `QueryRequest` → `compile_query`; off unless `ANTHROPIC_API_KEY` set |
 | GET | `/api` | — | API service info |
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
-| POST | `/api/auth/google` | — | Verify a Google ID token → session key, or `202` pending approval |
+| POST | `/api/auth/google` | — | Verify a Google ID token → session key (any verified account) |
 | POST | `/api/portal/register` | — | Demo: issue a key without auth (`ALLOW_DEMO_KEYS`) |
 | DELETE | `/api/portal/key` | key | Revoke your own session / portal-issued key |
 | GET | `/api/admin/registrations` | admin | List researcher registrations (`?status=`) |
-| POST | `/api/admin/registrations/{email}/approve` | admin | Approve an account |
+| POST | `/api/admin/registrations/{email}/approve` | admin | Restore a revoked account |
 | POST | `/api/admin/registrations/{email}/revoke` | admin | Revoke an account |
 | GET | `/api/tables` | key | List the DSA report tables + dataset period |
 | GET | `/api/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |

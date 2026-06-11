@@ -92,10 +92,11 @@ ISSUED_KEY_TTL = int(os.getenv("ISSUED_KEY_TTL_SECONDS", str(30 * 24 * 3600)))
 REGISTER_MAX_PER_WINDOW = int(os.getenv("PORTAL_REGISTER_MAX_PER_WINDOW", "10"))
 REGISTER_WINDOW = int(os.getenv("PORTAL_REGISTER_WINDOW_SECONDS", "3600"))
 # Google sign-in (FedCM via Google Identity Services). GOOGLE_CLIENT_ID is your
-# OAuth 2.0 Web client ID (the `aud` we verify ID tokens against). ADMIN_EMAILS is
-# a comma-separated allowlist of accounts that are implicitly approved and may
-# approve/revoke other researchers. A successful login mints a first-party session
-# key into the issued-key store, living GOOGLE_SESSION_TTL seconds.
+# OAuth 2.0 Web client ID (the `aud` we verify ID tokens against). Any verified
+# Google account is approved automatically on first sign-in; ADMIN_EMAILS is a
+# comma-separated allowlist of accounts that may use the admin endpoints to
+# revoke (and restore) other researchers. A successful login mints a first-party
+# session key into the issued-key store, living GOOGLE_SESSION_TTL seconds.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ADMIN_EMAILS = frozenset(
     e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
@@ -648,9 +649,10 @@ class RedisKeyStore:
         return n
 
 
-# Researcher registrations (Google sign-in + admin approval). Durable approval
-# state keyed by lowercased email — NOT expiring like session keys. Listable so an
-# admin can see who's pending.
+# Researcher registrations (Google sign-in; auto-approved on first sign-in).
+# Durable account state keyed by lowercased email — NOT expiring like session
+# keys. Its job is revocation: an admin revoke flips the status and kills live
+# sessions at once (re-checked per request). Listable for the admin endpoints.
 
 
 class MemoryRegistrationStore:
@@ -1392,11 +1394,11 @@ def root() -> dict[str, Any]:
             "POST /api/explore": "Public: run a bounded structured query inline (no auth, row-capped, rate-limited)",
             "POST /api/ask": "Ask in natural language (requires an API key) — an LLM writes the structured query (if enabled)",
             "GET /portal": "Researcher portal (web UI: sign in, get a key, browse the schema)",
-            "POST /api/auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key, or pending approval",
+            "POST /api/auth/google": "Sign in with a Google ID token (FedCM/GIS) → session key",
             "POST /api/portal/register": "Issue an API key without sign-in (disabled when ALLOW_DEMO_KEYS=0)",
             "DELETE /api/portal/key": "Revoke your session / portal-issued key",
             "GET /api/admin/registrations": "Admin: list researcher registrations",
-            "POST /api/admin/registrations/{email}/approve": "Admin: approve an account",
+            "POST /api/admin/registrations/{email}/approve": "Admin: restore a revoked account",
             "POST /api/admin/registrations/{email}/revoke": "Admin: revoke an account",
             "POST /api/query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
             "GET /api/jobs": "List your jobs",
@@ -1951,16 +1953,17 @@ def revoke_key(principal: dict = Depends(require_api_key)) -> dict[str, Any]:
     return {"revoked": True}
 
 
-# ── Google sign-in + admin approval ───────────────────────────────────────────
+# ── Google sign-in ────────────────────────────────────────────────────────────
 #
 # Frontend uses Google Identity Services (FedCM in supporting browsers) to obtain
-# an ID token, POSTs it here, and we verify it server-side. New accounts land in a
-# `pending` registration until an admin approves; admins (ADMIN_EMAILS) are
-# implicitly approved. Approved accounts get a first-party session key.
+# an ID token, POSTs it here, and we verify it server-side. Any verified Google
+# account is approved automatically on first sign-in (no admin review) and gets a
+# first-party session key. Admins keep a kill switch: a revoked account can't sign
+# in and its live sessions die immediately (status re-checked on every request).
 
 
 @api_router.post("/auth/google")
-def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -> dict[str, Any]:
+def auth_google(body: GoogleAuthRequest, request: Request) -> dict[str, Any]:
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google sign-in is not configured on this server.")
     # Throttle sign-in attempts per IP (reuses the registration limiter window).
@@ -1983,24 +1986,19 @@ def auth_google(body: GoogleAuthRequest, request: Request, response: Response) -
     now = _now()
 
     reg = _registrations.get(email)
-    is_admin = email in ADMIN_EMAILS
     if reg is None:
-        reg = {"email": email, "name": name,
-               "status": "approved" if is_admin else "pending",
-               "requested_at": now, "updated_at": now,
-               "approved_by": "auto:admin" if is_admin else None}
+        reg = {"email": email, "name": name, "status": "approved",
+               "requested_at": now, "updated_at": now, "approved_by": "auto:open"}
         _registrations.upsert(email, reg)
         logger.info("registration_created", extra={"data": {"email": email, "status": reg["status"]}})
-    elif is_admin and reg.get("status") != "approved":
-        reg.update(status="approved", updated_at=now, approved_by="auto:admin")
+    elif reg.get("status") == "pending":
+        # Accounts that registered while admin review was required are approved
+        # on their next sign-in.
+        reg.update(status="approved", updated_at=now, approved_by="auto:open")
         _registrations.upsert(email, reg)
 
-    if reg["status"] == "revoked":
+    if reg["status"] != "approved":  # only `revoked` remains
         raise HTTPException(status_code=403, detail="Your access has been revoked.")
-    if reg["status"] != "approved":
-        response.status_code = 202
-        return {"status": "pending", "email": email,
-                "message": "Your access request is awaiting admin approval."}
 
     key, expires_at = _mint_session(email, reg.get("name") or name)
     logger.info("session_minted", extra={"data": {"email": email}})
@@ -2020,7 +2018,7 @@ def list_registrations(status: str | None = None, _: dict = Depends(require_admi
 
 @api_router.post("/admin/registrations/{email}/approve")
 def approve_registration(email: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
-    """Approve an account (pre-approval is allowed before the user has signed in)."""
+    """Restore (or pre-create) an approved account — e.g. to undo a revoke."""
     email = email.strip().lower()
     now = _now()
     reg = _registrations.get(email)
