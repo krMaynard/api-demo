@@ -1230,6 +1230,10 @@ class TestCompositeQueries:
         r = client.post("/api/explore", json=q)
         assert r.status_code == 400 and "nosuch.x" in r.json()["detail"]
 
+    def test_expr_tolerates_surrounding_whitespace(self):
+        q = _ratio_query(derived=[{"alias": "ratio", "expr": "  actions.a / appeals.p  "}])
+        assert client.post("/api/explore", json=q).status_code == 200
+
     def test_malformed_exprs_rejected(self):
         for expr in ["actions.a /", "(actions.a", "actions.a ; DROP TABLE x",
                      "actions.a + 'x'", "actions"]:

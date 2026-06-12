@@ -1219,6 +1219,9 @@ _EXPR_TOKEN = re.compile(
 
 
 def _tokenize_expr(expr: str) -> list[tuple[str, str]]:
+    # The token regex consumes leading whitespace per token; trailing whitespace
+    # would otherwise fail to match anything and read as a confusing error.
+    expr = expr.strip()
     tokens: list[tuple[str, str]] = []
     pos = 0
     while pos < len(expr):
@@ -1452,9 +1455,12 @@ def _compile_composite(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
     spine = " UNION ".join(f"SELECT {key_cols} FROM l_{leg_name}" for leg_name in legs)
     ctes.append(f"spine AS ({spine})")
 
+    # `IS` (SQLite's NULL-safe equality) instead of `=`: the dimension columns are
+    # NOT NULL today, but a future nullable dimension would silently fail to join
+    # under `=` (NULL = NULL is UNKNOWN) and surface as bogus all-NULL rows.
     joins = " ".join(
         f"LEFT JOIN l_{leg_name} ON "
-        + " AND ".join(f"l_{leg_name}.{d} = spine.{d}" for d in req.join_on)
+        + " AND ".join(f"l_{leg_name}.{d} IS spine.{d}" for d in req.join_on)
         for leg_name in legs
     )
     inner = f"SELECT {', '.join(outer_cols)} FROM spine {joins}"

@@ -556,6 +556,10 @@ function applyCmpPreset() {
 
 async function runCompare() {
   $("#cmp-error").textContent = "";
+  // Reset the chart up front so a failed run never leaves a stale chart from
+  // the previous comparison sitting above the error message.
+  if (cmpChart) { cmpChart.destroy(); cmpChart = null; }
+  $("#cmp-chart").style.display = "none";
   const q = buildCompareQuery();
   $("#cmp-json").textContent = JSON.stringify(q, null, 2);
   const runBtn = $("#cmp-run");
@@ -580,7 +584,6 @@ async function runCompare() {
   // Chart the derived column (last) by join key; rows where it's NULL are shown
   // in the table but skipped in the chart (no meaningful bar to draw).
   const charted = d.rows.filter(r => r[r.length - 1] != null);
-  if (cmpChart) cmpChart.destroy();
   if (chartReady() && charted.length) {
     $("#cmp-chart").style.display = "";
     cmpChart = new Chart($("#cmp-chart"), {
