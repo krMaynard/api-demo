@@ -30,7 +30,7 @@ Built to demonstrate two things:
 | `seed.py` | Build `demo.db` from a `vlop-dsa.json` (`--source`/`SEED_SOURCE_JSON`; default = sibling repo) — `build_db()` is reused by `conftest.py` |
 | `data/vlop-dsa.json` | Vendored dataset snapshot — what the Docker image is seeded from (refresh via `scripts/refresh-dataset.sh`) |
 | `demo.py` | Narrated walkthrough script (run after starting the server) |
-| `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js overview + interactive query builder + NL "Ask" box (`GET /api/overview`, `POST /api/explore`, `POST /api/ask`) |
+| `static/index.html` | Public VLOP dashboard (served at `/`) — Chart.js overview + interactive query builder + "Compare tables" composite panel + NL "Ask" box (`GET /api/overview`, `POST /api/explore`, `POST /api/ask`) |
 | `static/vendor/chart.umd.js` | Vendored Chart.js 4.4.4 (self-hosted, not a CDN) — served by the `/static/vendor/{filename}` route so the dashboard CSP stays `script-src 'self'` |
 | `static/portal.html` | Researcher portal single-page app (served at `/portal`) — Google sign-in + demo fallback |
 | `Dockerfile` | Self-contained image: installs deps, seeds `demo.db` at build time, runs uvicorn on `$PORT` as non-root |
@@ -145,6 +145,18 @@ FROM/joins and the registry of:
 `compile_query` is the single trust boundary — it resolves `req.table` to a
 `TableSpec` and validates every field/operation against that table's registry.
 Never build SQL by interpolating user values (always bind with `?`).
+
+**Composite (cross-table) queries**: instead of `table`, a request may carry
+`legs` (2–4 named single-table sub-queries, each validated against its own
+`TableSpec`; ≤2 on public `/api/explore` via `EXPLORE_MAX_LEGS`), `join_on`
+(merge keys — must be a dimension of every leg's table; each leg is implicitly
+grouped by them), `derived` (four-function arithmetic over `leg.alias` refs,
+parsed by `_compile_expr` into SQL with `NULLIF` division — never interpolated),
+and `having` (the condition grammar over output columns). `_compile_composite`
+emits one statement: leg CTEs + a `spine` CTE (UNION of leg keys → full-outer
+semantics, unmatched keys kept with NULLs) + LEFT JOINs + an outer
+having/sort/limit. `compile_query` dispatches on the presence of `legs`, so
+every endpoint (query/explore/ask) gets composites through the same boundary.
 
 ## Key design decisions
 
@@ -271,7 +283,7 @@ root. The API endpoints are registered on an `APIRouter` included with
 | GET | `/` | — | Public VLOP transparency dashboard (web UI) |
 | GET | `/api/overview` | — | Public headline aggregates powering the dashboard |
 | GET | `/api/explore/options` | — | Public: tables + dimensions/measures for the query builder |
-| POST | `/api/explore` | — | Public: run a bounded structured query inline (row-capped, IP-rate-limited) |
+| POST | `/api/explore` | — | Public: run a bounded structured query inline (row-capped, IP-rate-limited, ≤`EXPLORE_MAX_LEGS` composite legs) |
 | POST | `/api/ask` | — | Public: NL→query via an LLM (Claude) → structured `QueryRequest` → `compile_query`; off unless `ANTHROPIC_API_KEY` set |
 | GET | `/api` | — | API service info |
 | GET | `/portal` | — | Researcher portal web UI (sign in → key → schema) |
@@ -284,7 +296,7 @@ root. The API endpoints are registered on an `APIRouter` included with
 | GET | `/api/tables` | key | List the DSA report tables + dataset period |
 | GET | `/api/fields?table=…` | key | Fields + operations for a table (no arg → table overview) |
 | GET | `/api/schema/{table}` | key | Field registry for a report table |
-| POST | `/api/query` | key | Submit structured query (optional `callback_url`) → 202 + job_id |
+| POST | `/api/query` | key | Submit structured query — single-table or composite (optional `callback_url`) → 202 + job_id |
 | GET | `/api/jobs` | key | List your jobs |
 | GET | `/api/jobs/{id}` | key | Job status |
 | GET | `/api/jobs/{id}/result?format=json\|csv` | key | Result (status=done only) |

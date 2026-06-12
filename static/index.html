@@ -246,6 +246,35 @@
     </div>
     <details><summary>Request JSON (try it via the API)</summary><pre id="ex-json"></pre></details>
   </section>
+
+  <section class="card" id="compare-card">
+    <h2>Compare tables</h2>
+    <p class="sub">Cross-table analysis — two sub-queries merged per service with a computed
+      ratio (the same validated <code>POST /api/explore</code>, composite shape).</p>
+    <div class="controls">
+      <label>Preset <select id="cmp-preset"></select></label>
+      <label>A: table <select id="cmp-table-a"></select></label>
+      <label>A: measure <select id="cmp-measure-a"></select></label>
+      <label>B: table <select id="cmp-table-b"></select></label>
+      <label>B: measure <select id="cmp-measure-b"></select></label>
+      <label>Join on <select id="cmp-join"></select></label>
+      <label>Compute <select id="cmp-derived">
+        <option value="a_div_b" selected>A ÷ B</option>
+        <option value="b_div_a">B ÷ A</option>
+        <option value="pct_a_of_b">A as % of B</option>
+        <option value="a_per_1k_b">A per 1,000 B</option>
+      </select></label>
+      <button id="cmp-run" type="button">Compare</button>
+    </div>
+    <div class="error" id="cmp-error" role="alert"></div>
+    <canvas id="cmp-chart" height="150" aria-hidden="true"></canvas>
+    <div id="cmp-out" aria-live="polite"></div>
+    <div class="resactions hidden" id="cmp-actions">
+      <button class="ghost" id="cmp-csv" type="button">Download CSV</button>
+      <button class="ghost" id="cmp-json-dl" type="button">Download JSON</button>
+    </div>
+    <details><summary>Request JSON (try it via the API)</summary><pre id="cmp-json"></pre></details>
+  </section>
  </main>
 
   <footer>
@@ -448,6 +477,158 @@ async function setupExplore() {
   runExplore();  // show an initial result
 }
 
+// ── Compare tables (composite /api/explore: legs + join_on + derived) ────────
+let cmpChart = null;
+let lastCompare = null;
+
+// One-click cross-table analyses. `filters` (per leg) become that leg's `query`.
+const CMP_PRESETS = [
+  { label: "Actions per appeal", a: { table: "t5_own_initiative_illegal", measure: "measures" },
+    b: { table: "t7_appeals_recidivism", measure: "value" }, derived: "a_div_b" },
+  { label: "Notices per 1,000 users", a: { table: "t4_notices", measure: "notices" },
+    b: { table: "t10_amar", measure: "value" }, derived: "a_per_1k_b" },
+  { label: "Trusted-flagger share of notices (%)", a: { table: "t4_notices", measure: "tf_notices" },
+    b: { table: "t4_notices", measure: "notices" }, derived: "pct_a_of_b" },
+  { label: "Custom…", custom: true },
+];
+
+const CMP_EXPRS = {
+  a_div_b: { expr: "a.av / b.bv", label: "A ÷ B" },
+  b_div_a: { expr: "b.bv / a.av", label: "B ÷ A" },
+  pct_a_of_b: { expr: "100 * a.av / b.bv", label: "A as % of B" },
+  a_per_1k_b: { expr: "1000 * a.av / b.bv", label: "A per 1,000 B" },
+};
+
+// Ratios and per-1k rates need decimals; counts don't. "—" keeps NULLs (a service
+// missing from one leg — kept by the full-outer merge) distinct from real zeros.
+const fmtCell = (v) => v == null ? "—"
+  : Number.isInteger(v) ? fmt(v)
+  : v.toLocaleString(undefined, { maximumSignificantDigits: 4 });
+
+function cmpMeasures(table) {
+  const t = exOptions.tables.find(x => x.table === table);
+  return t && t.measures.length ? t.measures : null;
+}
+
+function onCmpTableChange(which) {
+  const table = $(`#cmp-table-${which}`).value;
+  const mSel = $(`#cmp-measure-${which}`);
+  const measures = cmpMeasures(table);
+  fillSelect(mSel, measures || ["(rows)"]);
+  mSel.disabled = !measures;
+  // Join dims = dimensions present in BOTH tables (what the API validates).
+  const dims = (t) => exOptions.tables.find(x => x.table === t).dimensions;
+  const shared = dims($("#cmp-table-a").value).filter(d => dims($("#cmp-table-b").value).includes(d));
+  const prev = $("#cmp-join").value;
+  fillSelect($("#cmp-join"), shared);
+  if (shared.includes(prev)) $("#cmp-join").value = prev;
+  else if (shared.includes("service_name")) $("#cmp-join").value = "service_name";
+}
+
+function buildCompareQuery() {
+  const leg = (which, alias) => {
+    const table = $(`#cmp-table-${which}`).value;
+    const measures = cmpMeasures(table);
+    const agg = measures
+      ? { function: "SUM", field_name: $(`#cmp-measure-${which}`).value, alias }
+      : { function: "COUNT", field_name: "*", alias };
+    return { table, aggregates: [agg] };
+  };
+  return {
+    legs: { a: leg("a", "av"), b: leg("b", "bv") },
+    join_on: [$("#cmp-join").value],
+    derived: [{ alias: "result", expr: CMP_EXPRS[$("#cmp-derived").value].expr }],
+    sort: [{ field_name: "result", order: "desc" }],
+    max_count: 50,
+  };
+}
+
+function applyCmpPreset() {
+  const p = CMP_PRESETS[Number($("#cmp-preset").value)];
+  if (!p || p.custom) return;
+  $("#cmp-table-a").value = p.a.table;
+  $("#cmp-table-b").value = p.b.table;
+  onCmpTableChange("a"); onCmpTableChange("b");
+  $("#cmp-measure-a").value = p.a.measure;
+  $("#cmp-measure-b").value = p.b.measure;
+  $("#cmp-derived").value = p.derived;
+}
+
+async function runCompare() {
+  $("#cmp-error").textContent = "";
+  // Reset the chart up front so a failed run never leaves a stale chart from
+  // the previous comparison sitting above the error message.
+  if (cmpChart) { cmpChart.destroy(); cmpChart = null; }
+  $("#cmp-chart").style.display = "none";
+  const q = buildCompareQuery();
+  $("#cmp-json").textContent = JSON.stringify(q, null, 2);
+  const runBtn = $("#cmp-run");
+  runBtn.disabled = true;
+  $("#cmp-out").setAttribute("aria-busy", "true");
+  $("#cmp-out").innerHTML = "<p class='loading'>Running comparison…</p>";
+  let d;
+  try {
+    const res = await fetch("/api/explore", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(q),
+    });
+    d = await res.json();
+    if (!res.ok) throw new Error(d.detail || `HTTP ${res.status}`);
+  } catch (err) {
+    $("#cmp-error").textContent = "Comparison failed: " + err.message;
+    $("#cmp-out").innerHTML = "";
+    return;
+  } finally {
+    runBtn.disabled = false;
+    $("#cmp-out").setAttribute("aria-busy", "false");
+  }
+  // Chart the derived column (last) by join key; rows where it's NULL are shown
+  // in the table but skipped in the chart (no meaningful bar to draw).
+  const charted = d.rows.filter(r => r[r.length - 1] != null);
+  if (chartReady() && charted.length) {
+    $("#cmp-chart").style.display = "";
+    cmpChart = new Chart($("#cmp-chart"), {
+      type: "bar",
+      data: { labels: charted.map(r => r[0]),
+              datasets: [{ label: CMP_EXPRS[$("#cmp-derived").value].label,
+                           data: charted.map(r => r[r.length - 1]),
+                           backgroundColor: "#d29922", borderRadius: 4 }] },
+      options: {
+        indexAxis: "y", plugins: { legend: { display: false } },
+        scales: { x: { ticks: { color: "#9aa7b4" }, grid: { color: "#30363d" } },
+                  y: { ticks: { color: "#e6edf3" }, grid: { display: false } } },
+      },
+    });
+  } else {
+    $("#cmp-chart").style.display = "none";  // the result table below still renders
+  }
+  const head = `<tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>`;
+  const body = d.rows.map(r =>
+    `<tr>${r.map((v) => typeof v === "string" ? `<td>${esc(v)}</td>` : `<td class="num">${fmtCell(v)}</td>`).join("")}</tr>`
+  ).join("");
+  $("#cmp-out").innerHTML = (d.rows.length ? `<table class="restable">${head}${body}</table>` : "") + truncNote(d);
+  lastCompare = d;
+  $("#cmp-actions").classList.toggle("hidden", !d.rows.length);
+}
+
+function setupCompare() {
+  if (!exOptions) { $("#compare-card").classList.add("hidden"); return; }
+  $("#cmp-preset").innerHTML = CMP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("");
+  const tables = exOptions.tables.map(t => t.table);
+  fillSelect($("#cmp-table-a"), tables);
+  fillSelect($("#cmp-table-b"), tables);
+  onCmpTableChange("a"); onCmpTableChange("b");
+  applyCmpPreset();
+  $("#cmp-preset").addEventListener("change", () => { applyCmpPreset(); runCompare(); });
+  ["a", "b"].forEach(w => $(`#cmp-table-${w}`).addEventListener("change", () => {
+    $("#cmp-preset").value = String(CMP_PRESETS.findIndex(p => p.custom));
+    onCmpTableChange(w);
+  }));
+  $("#cmp-run").addEventListener("click", runCompare);
+  $("#cmp-csv").addEventListener("click", () => lastCompare && downloadBlob("vlop-compare.csv", toCSV(lastCompare), "text/csv"));
+  $("#cmp-json-dl").addEventListener("click", () => lastCompare && downloadBlob("vlop-compare.json", JSON.stringify(lastCompare, null, 2), "application/json"));
+  runCompare();  // show the first preset's result
+}
+
 // ── Natural-language query (POST /api/ask) ───────────────────────────────────
 let askChart = null;
 
@@ -615,7 +796,8 @@ document.addEventListener("DOMContentLoaded", () => {
   if (chartReady() && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     Chart.defaults.animation = false;
   }
-  load(); setupExplore(); setupAsk();
+  // setupCompare needs the /api/explore/options payload setupExplore fetches.
+  load(); setupExplore().then(setupCompare); setupAsk();
 });
 </script>
 <script>

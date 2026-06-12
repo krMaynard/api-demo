@@ -67,7 +67,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -125,6 +125,7 @@ QUERY_RATE_WINDOW = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
 # validated structured query inline, but hard-caps rows and is IP-rate-limited so
 # the unauthenticated endpoint can't be abused.
 EXPLORE_MAX_ROWS = int(os.getenv("EXPLORE_MAX_ROWS", "500"))
+EXPLORE_MAX_LEGS = int(os.getenv("EXPLORE_MAX_LEGS", "2"))
 EXPLORE_RATE_MAX = int(os.getenv("EXPLORE_RATE_MAX_PER_WINDOW", "60"))
 EXPLORE_RATE_WINDOW = int(os.getenv("EXPLORE_RATE_WINDOW_SECONDS", "60"))
 # Natural-language → structured-query (POST /api/ask). An LLM (Claude) translates
@@ -977,6 +978,13 @@ class Condition(BaseModel):
 # aggregate columns and compile into an enormous statement.
 _MAX_CONDITIONS = 50
 _MAX_OUTPUT_COLUMNS = 50
+# Composite (multi-leg) query bounds. /api/explore additionally caps legs at
+# EXPLORE_MAX_LEGS since it is unauthenticated.
+_MAX_LEGS = 4
+_MAX_JOIN_DIMS = 4
+_MAX_DERIVED = 10
+_MAX_EXPR_LEN = 200
+_MAX_EXPR_DEPTH = 10
 
 
 class BooleanQuery(BaseModel):
@@ -1002,8 +1010,41 @@ class Sort(BaseModel):
     order: SortOrder = "desc"
 
 
+class Leg(BaseModel):
+    """One sub-query of a composite query: filters + aggregates over a single
+    table. Every leg is implicitly grouped by the composite's `join_on` keys, so
+    all legs aggregate to the same grain before being merged (full-outer)."""
+
+    table: str = Field(..., description="DSA report table this leg queries (see GET /tables).")
+    query: BooleanQuery = Field(default_factory=BooleanQuery, description="Filters for this leg only.")
+    aggregates: list[Aggregate] = Field(
+        ..., min_length=1, max_length=_MAX_OUTPUT_COLUMNS,
+        description="Aggregate columns; aliases must be unique across all legs.",
+    )
+
+
+class DerivedColumn(BaseModel):
+    """A computed output column over leg aggregates, e.g. a ratio."""
+
+    alias: str = Field(..., description="Output column name (letters, digits, underscore).")
+    expr: str = Field(
+        ..., min_length=1, max_length=_MAX_EXPR_LEN,
+        description="Arithmetic (+ - * / and parentheses) over `leg.alias` references "
+                    "and numeric literals, e.g. '100 * appeals.n / actions.a'. "
+                    "Division is NULL-safe (x/0 → null).",
+    )
+
+
 class QueryRequest(BaseModel):
-    """Structured query. No SQL is accepted."""
+    """Structured query. No SQL is accepted.
+
+    Two shapes share this model:
+    - **Single-table** (the default): set `table` plus `query`/`fields`/`group_by`/
+      `aggregates`.
+    - **Composite** (cross-table): set `legs` + `join_on` instead — each leg is a
+      single-table aggregate sub-query; legs are merged full-outer on `join_on`
+      and `derived` columns compute arithmetic (e.g. ratios) across them.
+    """
 
     table: str | None = Field(
         default=None, description="Which DSA report table to query (see GET /tables)."
@@ -1032,6 +1073,33 @@ class QueryRequest(BaseModel):
         max_length=2048,
         description="Optional http(s) webhook POSTed (HMAC-signed) when the job finishes.",
     )
+    # ── Composite (cross-table) shape ──────────────────────────────────────────
+    legs: dict[str, Leg] | None = Field(
+        default=None,
+        description="Composite query: named single-table sub-queries to merge "
+                    f"(2–{_MAX_LEGS}; leg names are letters/digits/underscores).",
+    )
+    join_on: list[str] = Field(
+        default_factory=list, max_length=_MAX_JOIN_DIMS,
+        description="Dimensions to merge legs on; must be a dimension of every leg's table.",
+    )
+    derived: list[DerivedColumn] = Field(
+        default_factory=list, max_length=_MAX_DERIVED,
+        description="Computed columns over leg aggregates (composite queries only).",
+    )
+    having: BooleanQuery = Field(
+        default_factory=BooleanQuery,
+        description="Post-merge filter on output columns (join_on dims, leg "
+                    "aggregate aliases, derived aliases). Composite queries only.",
+    )
+
+    @model_validator(mode="after")
+    def _bound_legs(self) -> "QueryRequest":
+        # Cheap structural bound enforced at parse time because /api/explore takes
+        # this model unauthenticated; semantic validation lives in compile_query.
+        if self.legs is not None and not (2 <= len(self.legs) <= _MAX_LEGS):
+            raise ValueError(f"`legs` must contain between 2 and {_MAX_LEGS} sub-queries.")
+        return self
 
 
 class QueryCompileError(ValueError):
@@ -1089,14 +1157,17 @@ def _compile_condition(cond: Condition, spec: TableSpec) -> tuple[str, list[Any]
     raise QueryCompileError(f"Unsupported operation '{op}'.")  # pragma: no cover
 
 
-def _compile_where(q: BooleanQuery, spec: TableSpec) -> tuple[str, list[Any]]:
+def _compile_bool(q: BooleanQuery, compile_cond: Any) -> tuple[str, list[Any]]:
+    """Combine a BooleanQuery's and/or/not clauses; `compile_cond` turns one
+    Condition into (sql_fragment, params) — table-scoped for WHERE clauses,
+    output-column-scoped for composite HAVING clauses."""
     groups: list[str] = []
     params: list[Any] = []
 
     def _and(conditions: list[Condition]) -> str:
         frags = []
         for c in conditions:
-            frag, p = _compile_condition(c, spec)
+            frag, p = compile_cond(c)
             frags.append(frag)
             params.extend(p)
         return " AND ".join(frags)
@@ -1106,19 +1177,23 @@ def _compile_where(q: BooleanQuery, spec: TableSpec) -> tuple[str, list[Any]]:
     if q.or_:
         frags = []
         for c in q.or_:
-            frag, p = _compile_condition(c, spec)
+            frag, p = compile_cond(c)
             frags.append(frag)
             params.extend(p)
         groups.append("(" + " OR ".join(frags) + ")")
     if q.not_:
         frags = []
         for c in q.not_:
-            frag, p = _compile_condition(c, spec)
+            frag, p = compile_cond(c)
             frags.append(f"NOT ({frag})")
             params.extend(p)
         groups.append(" AND ".join(frags))
 
     return " AND ".join(g for g in groups if g), params
+
+
+def _compile_where(q: BooleanQuery, spec: TableSpec) -> tuple[str, list[Any]]:
+    return _compile_bool(q, lambda c: _compile_condition(c, spec))
 
 
 def _safe_alias(alias: str) -> str:
@@ -1127,8 +1202,303 @@ def _safe_alias(alias: str) -> str:
     return alias
 
 
+# ── Derived-column expressions (composite queries) ────────────────────────────
+#
+# A tiny recursive-descent parser for four-function arithmetic over `leg.alias`
+# references and numeric literals. The expression is tokenised with a strict
+# regex and compiled to SQL during the parse — user text is never interpolated:
+# references resolve through a pre-validated map and numbers are re-emitted from
+# the regex-matched literal. Division compiles to CAST(x AS REAL) / NULLIF(y, 0)
+# so integer SUMs divide as reals and ÷0 yields NULL instead of an error.
+
+_EXPR_TOKEN = re.compile(
+    r"\s*(?:(?P<num>\d+(?:\.\d+)?)"
+    r"|(?P<ref>[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<op>[-+*/()]))"
+)
+
+
+def _tokenize_expr(expr: str) -> list[tuple[str, str]]:
+    # The token regex consumes leading whitespace per token; trailing whitespace
+    # would otherwise fail to match anything and read as a confusing error.
+    expr = expr.strip()
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(expr):
+        m = _EXPR_TOKEN.match(expr, pos)
+        if m is None:
+            raise QueryCompileError(
+                f"Invalid expression near '{expr[pos:pos + 20]}': only numbers, "
+                "`leg.alias` references, + - * / and parentheses are allowed."
+            )
+        tokens.append((m.lastgroup or "", m.group(m.lastgroup or "")))
+        pos = m.end()
+    if not tokens:
+        raise QueryCompileError("Empty derived expression.")
+    return tokens
+
+
+def _compile_expr(expr: str, refs: dict[str, str]) -> str:
+    """Parse + compile a derived-column expression to SQL. `refs` maps the legal
+    `leg.alias` references onto already-validated SQL column expressions."""
+    tokens = _tokenize_expr(expr)
+    pos = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[pos] if pos < len(tokens) else None
+
+    def take() -> tuple[str, str]:
+        nonlocal pos
+        tok = tokens[pos]
+        pos += 1
+        return tok
+
+    def parse_sum(depth: int) -> str:
+        left = parse_product(depth)
+        while (tok := peek()) and tok[1] in ("+", "-"):
+            take()
+            right = parse_product(depth)
+            left = f"({left} {tok[1]} {right})"
+        return left
+
+    def parse_product(depth: int) -> str:
+        left = parse_factor(depth)
+        while (tok := peek()) and tok[1] in ("*", "/"):
+            take()
+            right = parse_factor(depth)
+            if tok[1] == "/":
+                left = f"(CAST({left} AS REAL) / NULLIF({right}, 0))"
+            else:
+                left = f"({left} * {right})"
+        return left
+
+    def parse_factor(depth: int) -> str:
+        if depth > _MAX_EXPR_DEPTH:
+            raise QueryCompileError("Expression is nested too deeply.")
+        tok = peek()
+        if tok is None:
+            raise QueryCompileError(f"Incomplete expression '{expr}'.")
+        kind, text = take()
+        if kind == "num":
+            return text
+        if kind == "ref":
+            if text not in refs:
+                raise QueryCompileError(
+                    f"Unknown reference '{text}' in derived expression; use "
+                    "`leg.alias` where `leg` is a leg name and `alias` one of its "
+                    f"aggregate aliases. Available: {', '.join(sorted(refs)) or '(none)'}."
+                )
+            return refs[text]
+        if text == "-":
+            return f"(-{parse_factor(depth + 1)})"
+        if text == "(":
+            inner = parse_sum(depth + 1)
+            nxt = peek()
+            if nxt is None or nxt[1] != ")":
+                raise QueryCompileError(f"Unbalanced parentheses in expression '{expr}'.")
+            take()
+            return inner
+        raise QueryCompileError(f"Unexpected '{text}' in expression '{expr}'.")
+
+    sql = parse_sum(0)
+    if pos != len(tokens):
+        raise QueryCompileError(f"Unexpected trailing '{tokens[pos][1]}' in expression '{expr}'.")
+    return sql
+
+
+def _coerce_number(value: Any, field_name: str) -> float | int:
+    """Numeric `having` values may arrive as strings (e.g. from the NL layer);
+    coerce rather than reject, since the comparison column is always numeric."""
+    if isinstance(value, bool):
+        raise QueryCompileError(f"Field '{field_name}' requires numeric values.")
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise QueryCompileError(f"Field '{field_name}' requires numeric values.")
+
+
+def _compile_output_condition(cond: Condition, col_types: dict[str, str]) -> tuple[str, list[Any]]:
+    """Compile a `having` condition against the composite's output columns.
+    Column names were validated by _safe_alias / the dimension registry, so they
+    are safe to emit; values are always bound."""
+    field = cond.field_name
+    if field not in col_types:
+        raise QueryCompileError(
+            f"Unknown `having` field '{field}'; it must be an output column "
+            f"(one of: {', '.join(col_types)})."
+        )
+    numeric = col_types[field] == "numeric"
+    op = cond.operation
+    values = cond.field_values
+
+    if op in _COMPARATORS:
+        if not numeric:
+            raise QueryCompileError(f"Operation {op} is only valid on numeric output columns, not '{field}'.")
+        if len(values) != 1:
+            raise QueryCompileError(f"Operation {op} takes exactly one value.")
+        return f"{field} {_COMPARATORS[op]} ?", [_coerce_number(values[0], field)]
+
+    if op == "EQ":
+        if len(values) != 1:
+            raise QueryCompileError("Operation EQ takes exactly one value; use IN for multiple.")
+        if numeric:
+            return f"{field} = ?", [_coerce_number(values[0], field)]
+        _require_string(values[0], field)
+        return f"{field} = ?", [values[0]]
+
+    if op == "IN":
+        bound: list[Any] = []
+        for v in values:
+            if numeric:
+                bound.append(_coerce_number(v, field))
+            else:
+                _require_string(v, field)
+                bound.append(v)
+        placeholders = ", ".join(["?"] * len(values))
+        return f"{field} IN ({placeholders})", bound
+
+    raise QueryCompileError(f"Unsupported operation '{op}'.")  # pragma: no cover
+
+
+def _compile_composite(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
+    """Compile a multi-leg composite query to one parameterised statement.
+
+    Shape: each leg compiles to a CTE (its own single-table WHERE + aggregates,
+    grouped by the join keys); a `spine` CTE is the UNION of every leg's keys
+    (full-outer semantics — a service missing from one leg still appears, with
+    NULLs); the outer SELECT LEFT JOINs each leg back to the spine, computes the
+    derived columns, and applies having/sort/limit. Every value is bound; every
+    identifier comes from the validated registry or _safe_alias."""
+    legs = req.legs or {}
+    if req.table:
+        raise QueryCompileError("Use either `table` (single-table) or `legs` (composite), not both.")
+    if req.fields or req.group_by or req.aggregates:
+        raise QueryCompileError(
+            "Composite queries take filters/aggregates inside each leg; "
+            "top-level `fields`/`group_by`/`aggregates` are not allowed."
+        )
+    if not req.join_on:
+        raise QueryCompileError(
+            "Composite queries require `join_on`: the dimension(s) every leg is "
+            "grouped by and merged on (e.g. [\"service_name\"])."
+        )
+    if len(set(req.join_on)) != len(req.join_on):
+        raise QueryCompileError("Duplicate field in `join_on`.")
+
+    # Resolve every leg's table and check the join keys are shared dimensions.
+    specs: dict[str, TableSpec] = {}
+    for leg_name, leg in legs.items():
+        _safe_alias(leg_name)
+        spec = TABLES.get(leg.table)
+        if spec is None:
+            raise QueryCompileError(f"Unknown table '{leg.table}' in leg '{leg_name}'. See GET /tables.")
+        specs[leg_name] = spec
+    for dim in req.join_on:
+        for leg_name, leg in legs.items():
+            if dim not in specs[leg_name].dimensions:
+                shared = set.intersection(*(set(s.dimensions) for s in specs.values()))
+                raise QueryCompileError(
+                    f"join_on field '{dim}' is not a dimension of table '{leg.table}' "
+                    f"(leg '{leg_name}'). Dimensions shared by every leg here: "
+                    f"{', '.join(sorted(shared)) or '(none)'}."
+                )
+
+    # Output columns: join keys (text), then leg aggregate aliases (numeric,
+    # globally unique), then derived aliases (numeric).
+    col_types: dict[str, str] = {d: "text" for d in req.join_on}
+    refs: dict[str, str] = {}  # "leg.alias" → "l_leg.alias" for derived exprs
+    params: list[Any] = []
+    ctes: list[str] = []
+    outer_cols = [f"spine.{d} AS {d}" for d in req.join_on]
+
+    for leg_name, leg in legs.items():
+        spec = specs[leg_name]
+        select_parts = [f"{spec.dimensions[d]} AS {d}" for d in req.join_on]
+        for agg in leg.aggregates:
+            alias = _safe_alias(agg.alias)
+            if alias in col_types:
+                raise QueryCompileError(
+                    f"Duplicate output column '{alias}': aggregate aliases must be "
+                    "unique across all legs and must not clash with join_on fields."
+                )
+            if agg.function == "COUNT" and agg.field_name in ("*", ""):
+                expr = "COUNT(*)"
+            elif agg.field_name not in spec.measures:
+                raise QueryCompileError(
+                    f"Aggregate field '{agg.field_name}' must be a numeric measure of "
+                    f"'{leg.table}' (leg '{leg_name}'). See GET /fields?table={leg.table}"
+                )
+            else:
+                expr = f"{agg.function}({spec.measures[agg.field_name]})"
+            select_parts.append(f"{expr} AS {alias}")
+            col_types[alias] = "numeric"
+            refs[f"{leg_name}.{alias}"] = f"l_{leg_name}.{alias}"
+            outer_cols.append(f"l_{leg_name}.{alias} AS {alias}")
+        where, leg_params = _compile_where(leg.query, spec)
+        leg_sql = f"SELECT {', '.join(select_parts)} {spec.from_sql}"
+        if where:
+            leg_sql += f" WHERE {where}"
+        leg_sql += " GROUP BY " + ", ".join(spec.dimensions[d] for d in req.join_on)
+        ctes.append(f"l_{leg_name} AS ({leg_sql})")
+        params.extend(leg_params)
+
+    for d in req.derived:
+        alias = _safe_alias(d.alias)
+        if alias in col_types:
+            raise QueryCompileError(f"Duplicate or clashing derived alias '{alias}'.")
+        outer_cols.append(f"{_compile_expr(d.expr, refs)} AS {alias}")
+        col_types[alias] = "numeric"
+
+    key_cols = ", ".join(req.join_on)
+    spine = " UNION ".join(f"SELECT {key_cols} FROM l_{leg_name}" for leg_name in legs)
+    ctes.append(f"spine AS ({spine})")
+
+    # `IS` (SQLite's NULL-safe equality) instead of `=`: the dimension columns are
+    # NOT NULL today, but a future nullable dimension would silently fail to join
+    # under `=` (NULL = NULL is UNKNOWN) and surface as bogus all-NULL rows.
+    joins = " ".join(
+        f"LEFT JOIN l_{leg_name} ON "
+        + " AND ".join(f"l_{leg_name}.{d} IS spine.{d}" for d in req.join_on)
+        for leg_name in legs
+    )
+    inner = f"SELECT {', '.join(outer_cols)} FROM spine {joins}"
+
+    # Wrapping the merge in a subselect lets having/sort address output columns
+    # by name (already validated identifiers; values bound as parameters).
+    sql = "WITH " + ", ".join(ctes) + f" SELECT * FROM ({inner})"
+    having_sql, having_params = _compile_bool(
+        req.having, lambda c: _compile_output_condition(c, col_types)
+    )
+    if having_sql:
+        sql += f" WHERE {having_sql}"
+        params.extend(having_params)
+
+    order_parts = []
+    for s in req.sort:
+        if s.field_name not in col_types:
+            raise QueryCompileError(
+                f"Cannot sort by '{s.field_name}'; it is not an output column "
+                f"(one of: {', '.join(col_types)})."
+            )
+        order_parts.append(f"{s.field_name} {'DESC' if s.order == 'desc' else 'ASC'}")
+    if order_parts:
+        sql += " ORDER BY " + ", ".join(order_parts)
+    sql += f" LIMIT {min(req.max_count, ROW_LIMIT)}"
+
+    return sql, params, list(col_types)
+
+
 def compile_query(req: QueryRequest) -> tuple[str, list[Any], list[str]]:
-    """Validate a structured query and compile it to (sql, params, output_columns)."""
+    """Validate a structured query and compile it to (sql, params, output_columns).
+    Dispatches on shape: `legs` → composite (cross-table merge), else single-table."""
+    if req.legs is not None:
+        return _compile_composite(req)
+    if req.join_on or req.derived or req.having.and_ or req.having.or_ or req.having.not_:
+        raise QueryCompileError(
+            "`join_on`/`derived`/`having` are only valid in a composite query — supply `legs`."
+        )
     if not req.table:
         raise QueryCompileError(
             "`table` is required. Choose one of: " + ", ".join(TABLES) + ". See GET /tables."
@@ -1400,7 +1770,7 @@ def root() -> dict[str, Any]:
             "GET /api/admin/registrations": "Admin: list researcher registrations",
             "POST /api/admin/registrations/{email}/approve": "Admin: restore a revoked account",
             "POST /api/admin/registrations/{email}/revoke": "Admin: revoke an account",
-            "POST /api/query": "Submit a structured query over a `table` (optional callback_url webhook), returns 202 + job_id",
+            "POST /api/query": "Submit a structured query — single-table (`table`) or composite (`legs`+`join_on`+`derived`) — returns 202 + job_id",
             "GET /api/jobs": "List your jobs",
             "GET /api/jobs/{job_id}": "Job status (your jobs only)",
             "GET /api/jobs/{job_id}/result?format=json|csv": "Result (only when status=done)",
@@ -1656,6 +2026,15 @@ def explore_options() -> dict[str, Any]:
         ],
         "aggregates": ["SUM", "AVG", "MAX", "MIN", "COUNT"],
         "max_rows": EXPLORE_MAX_ROWS,
+        # Composite (cross-table) queries: legs are merged full-outer on join_on
+        # dimensions shared by every leg's table; derived columns are arithmetic
+        # over `leg.alias` references. The UI derives valid join dimensions by
+        # intersecting the `dimensions` lists above.
+        "composite": {
+            "max_legs": EXPLORE_MAX_LEGS,
+            "derived_operators": "+ - * / ( )",
+            "join_on": "any dimension present in every leg's table",
+        },
     }
 
 
@@ -1669,36 +2048,35 @@ class AskRequest(BaseModel):
 # JSON schema the LLM must fill — a constrained, flat projection of QueryRequest.
 # Strict so structured outputs reliably return a valid object; compile_query still
 # does the real validation against the table registry afterward.
+_ASK_FILTERS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "field": {"type": "string"},
+            "op": {"type": "string", "enum": ["EQ", "IN", "GT", "GTE", "LT", "LTE"]},
+            "values": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["field", "op", "values"],
+    },
+}
+_ASK_AGG_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "function": {"type": "string", "enum": ["SUM", "AVG", "MIN", "MAX", "COUNT"]},
+        "field": {"type": "string"},
+        "alias": {"type": "string"},
+    },
+    "required": ["function", "field", "alias"],
+}
 _ASK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "table": {"type": "string", "enum": list(TABLES)},
-        "filters": {
-            "type": "array",
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "properties": {
-                    "field": {"type": "string"},
-                    "op": {"type": "string", "enum": ["EQ", "IN", "GT", "GTE", "LT", "LTE"]},
-                    "values": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["field", "op", "values"],
-            },
-        },
+        "filters": _ASK_FILTERS_SCHEMA,
         "group_by": {"type": "array", "items": {"type": "string"}},
-        "aggregates": {
-            "type": "array",
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "properties": {
-                    "function": {"type": "string", "enum": ["SUM", "AVG", "MIN", "MAX", "COUNT"]},
-                    "field": {"type": "string"},
-                    "alias": {"type": "string"},
-                },
-                "required": ["function", "field", "alias"],
-            },
-        },
+        "aggregates": {"type": "array", "items": _ASK_AGG_SCHEMA},
         "sort": {
             "type": "array",
             "items": {
@@ -1711,8 +2089,37 @@ _ASK_SCHEMA: dict[str, Any] = {
             },
         },
         "max_count": {"type": "integer"},
+        # Composite (cross-table) shape: when `legs` is non-empty the flat fields
+        # above (except sort/max_count) are ignored and the query merges the legs
+        # on join_on, with derived arithmetic columns (e.g. ratios).
+        "legs": {
+            "type": "array",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "table": {"type": "string", "enum": list(TABLES)},
+                    "filters": _ASK_FILTERS_SCHEMA,
+                    "aggregate": _ASK_AGG_SCHEMA,
+                },
+                "required": ["name", "table", "filters", "aggregate"],
+            },
+        },
+        "join_on": {"type": "array", "items": {"type": "string"}},
+        "derived": {
+            "type": "array",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "alias": {"type": "string"},
+                    "expr": {"type": "string"},
+                },
+                "required": ["alias", "expr"],
+            },
+        },
     },
-    "required": ["table", "filters", "group_by", "aggregates", "sort", "max_count"],
+    "required": ["table", "filters", "group_by", "aggregates", "sort", "max_count",
+                 "legs", "join_on", "derived"],
 }
 
 
@@ -1741,6 +2148,17 @@ def _ask_system_prompt() -> str:
         "- service_name and platform exist on every table; platform is the parent company.",
         "- Default max_count to 10 unless the question implies otherwise.",
         "- Aggregate aliases must be letters, digits, or underscores.",
+        "- For single-table questions leave `legs`, `join_on`, and `derived` empty.",
+        "",
+        "Cross-table questions (ratios/comparisons across two tables, e.g. 'ratio of "
+        "actions to appeals', 'notices per monthly active user'): fill `legs` (2–4 "
+        "named single-table sub-queries, each with one aggregate), `join_on` (dimensions "
+        "present in EVERY leg's table — usually [\"service_name\"]), and `derived` "
+        "(arithmetic + - * / ( ) over `legname.alias` references, e.g. "
+        "\"appeals.p / actions.a\"). Legs are merged on join_on; sort may reference any "
+        "leg alias or derived alias. Set `table` to the first leg's table (it is "
+        "ignored when legs are present) and leave the flat filters/group_by/aggregates "
+        "empty.",
     ]
     return "\n".join(lines)
 
@@ -1793,28 +2211,54 @@ def _translate_question(question: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _ask_conditions(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"operation": f["op"], "field_name": f["field"], "field_values": f["values"]}
+        for f in filters
+    ]
+
+
+def _ask_aggregate(a: dict[str, Any]) -> dict[str, Any]:
+    is_count_star = a["function"] == "COUNT" and a.get("field", "*") in ("", "*", "rows", "(rows)")
+    return {
+        "function": a["function"],
+        "field_name": "*" if is_count_star else a["field"],
+        "alias": a["alias"],
+    }
+
+
 def _askquery_to_request(aq: dict[str, Any]) -> QueryRequest:
     """Map the LLM's constrained AskQuery dict onto the real QueryRequest model.
     QueryRequest construction + compile_query perform the actual validation."""
-    conditions = [
-        {"operation": f["op"], "field_name": f["field"], "field_values": f["values"]}
-        for f in aq.get("filters", [])
-    ]
-    aggregates = []
-    for a in aq.get("aggregates", []):
-        is_count_star = a["function"] == "COUNT" and a.get("field", "*") in ("", "*", "rows", "(rows)")
-        aggregates.append({
-            "function": a["function"],
-            "field_name": "*" if is_count_star else a["field"],
-            "alias": a["alias"],
-        })
+    sort = [{"field_name": s["field"], "order": s["order"]} for s in aq.get("sort", [])]
+    max_count = aq.get("max_count") or 10
+
+    legs = aq.get("legs") or []
+    if legs:
+        # Composite shape: the flat single-table fields are ignored by design.
+        payload: dict[str, Any] = {
+            "legs": {
+                leg["name"]: {
+                    "table": leg["table"],
+                    "query": {"and": _ask_conditions(leg.get("filters", []))},
+                    "aggregates": [_ask_aggregate(leg["aggregate"])],
+                }
+                for leg in legs
+            },
+            "join_on": aq.get("join_on", []),
+            "derived": aq.get("derived", []),
+            "sort": sort,
+            "max_count": max_count,
+        }
+        return QueryRequest.model_validate(payload)
+
     payload = {
         "table": aq.get("table"),
-        "query": {"and": conditions},
+        "query": {"and": _ask_conditions(aq.get("filters", []))},
         "group_by": aq.get("group_by", []),
-        "aggregates": aggregates,
-        "sort": [{"field_name": s["field"], "order": s["order"]} for s in aq.get("sort", [])],
-        "max_count": aq.get("max_count") or 10,
+        "aggregates": [_ask_aggregate(a) for a in aq.get("aggregates", [])],
+        "sort": sort,
+        "max_count": max_count,
     }
     # model_validate runs the same field validation as a request body would.
     return QueryRequest.model_validate(payload)
@@ -1849,6 +2293,13 @@ def explore(body: QueryRequest, request: Request) -> dict[str, Any]:
             status_code=429,
             detail="Too many queries from here. Please slow down.",
             headers={"Retry-After": str(EXPLORE_RATE_WINDOW)},
+        )
+    # The public endpoint gets a tighter composite budget than the keyed job API.
+    if body.legs is not None and len(body.legs) > EXPLORE_MAX_LEGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Public composite queries are limited to {EXPLORE_MAX_LEGS} legs; "
+                   "use POST /api/query (with an API key) for more.",
         )
     try:
         return _run_query_bounded(body)

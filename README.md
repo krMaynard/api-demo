@@ -125,6 +125,56 @@ caller-authored SQL.
 Call `GET /api/fields` for the full list of queryable dimensions, measures, and
 operations.
 
+### Composite queries (cross-table joins & ratios)
+
+A query may instead name **`legs`** — 2–4 named single-table sub-queries that are
+merged on shared dimensions, with computed columns over the merged result. This
+answers cross-table questions like *"what is the ratio of actions to appeals?"*
+without ever accepting SQL:
+
+```json
+{
+  "legs": {
+    "actions": {"table": "t5_own_initiative_illegal",
+                 "aggregates": [{"function": "SUM", "field_name": "measures", "alias": "a"}]},
+    "appeals": {"table": "t7_appeals_recidivism",
+                 "query": {"and": [{"operation": "EQ", "field_name": "section",
+                                    "field_values": ["Internal complaints mechanism"]}]},
+                 "aggregates": [{"function": "SUM", "field_name": "value", "alias": "p"}]}
+  },
+  "join_on": ["service_name"],
+  "derived": [{"alias": "appeals_per_action", "expr": "appeals.p / actions.a"}],
+  "having": {"and": [{"operation": "GT", "field_name": "appeals_per_action", "field_values": [0.01]}]},
+  "sort": [{"field_name": "appeals_per_action", "order": "desc"}]
+}
+```
+
+- **`legs`** — each leg is a normal single-table sub-query (its own `query`
+  filters + `aggregates`), implicitly grouped by `join_on`, so every leg
+  aggregates to the same grain before merging. Aggregate aliases must be unique
+  across legs.
+- **`join_on`** — the merge keys; must be a dimension of *every* leg's table
+  (`service_name`/`platform` always qualify; `category_code` works for t3–t6
+  pairs, `section`/`indicator`/`scope` for t7–t9 pairs, etc.).
+- **Full-outer merge** — a service present in one leg but not another is kept,
+  with `null` for the missing side (visible data gaps instead of silently
+  dropped rows).
+- **`derived`** — four-function arithmetic (`+ - * / ( )`) over `leg.alias`
+  references and numeric literals, parsed into a validated AST (never
+  interpolated). Division is real-valued and NULL-safe (`x/0` → `null`).
+- **`having`** — the same condition grammar, applied post-merge to output
+  columns (join dims, leg aliases, derived aliases).
+- **`sort`/`max_count`** — over any output column, as usual.
+
+Composites run everywhere single-table queries do: `POST /api/query` (async
+job), `POST /api/explore` (public, capped at `EXPLORE_MAX_LEGS`, default 2),
+`POST /api/ask` (the LLM can emit the composite shape), and the dashboard's
+**Compare tables** panel (presets like *actions per appeal* and *notices per
+1,000 users*). Validation is the same trust boundary: every table/field/alias
+is checked against the registry, every value is bound, and the whole composite
+compiles to one parameterised statement (legs as CTEs + a key-spine UNION +
+LEFT JOINs).
+
 ### Ask in plain English (LLM → structured query)
 
 `POST /api/ask` lets anyone ask a question in natural language ("Which platforms
@@ -525,6 +575,7 @@ All tuneable values are read from environment variables at startup:
 | `QUERY_RATE_MAX_PER_WINDOW` | `60` | Max `POST /api/query` submissions per API key per window |
 | `QUERY_RATE_WINDOW_SECONDS` | `60` | Query rate-limit window |
 | `EXPLORE_MAX_ROWS` | `500` | Hard row cap for the public `POST /api/explore` endpoint |
+| `EXPLORE_MAX_LEGS` | `2` | Max composite-query legs on the public `/api/explore` (keyed `/api/query` allows 4) |
 | `EXPLORE_RATE_MAX_PER_WINDOW` | `60` | Max public `/api/explore` queries per IP per window |
 | `EXPLORE_RATE_WINDOW_SECONDS` | `60` | Public explore rate-limit window |
 | `ANTHROPIC_API_KEY` | _(unset — `/api/ask` disabled)_ | Set to enable natural-language queries (Claude); read by the SDK |

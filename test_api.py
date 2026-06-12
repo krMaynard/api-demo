@@ -1126,6 +1126,161 @@ class TestExplore:
         assert r.status_code == 200
 
 
+# ── Composite (cross-table) queries ──────────────────────────────────────────
+
+def _ratio_query(**overrides):
+    """A canonical actions÷appeals composite over the fixture data."""
+    q = {
+        "legs": {
+            "actions": {"table": "t5_own_initiative_illegal",
+                        "aggregates": [{"function": "SUM", "field_name": "measures", "alias": "a"}]},
+            "appeals": {"table": "t7_appeals_recidivism",
+                        "aggregates": [{"function": "SUM", "field_name": "value", "alias": "p"}]},
+        },
+        "join_on": ["service_name"],
+        "derived": [{"alias": "ratio", "expr": "actions.a / appeals.p"}],
+        "sort": [{"field_name": "ratio", "order": "desc"}],
+    }
+    q.update(overrides)
+    return q
+
+
+class TestCompositeQueries:
+    def test_ratio_end_to_end_via_explore(self):
+        # Fixture: t5 has YouTube only (measures=9); t7 has YouTube=1000, Facebook=500.
+        r = client.post("/api/explore", json=_ratio_query())
+        assert r.status_code == 200
+        d = r.json()
+        assert d["columns"] == ["service_name", "a", "p", "ratio"]
+        rows = {row[0]: row for row in d["rows"]}
+        assert rows["YouTube"][1:] == [9, 1000, 0.009]
+        # Full-outer semantics: Facebook has no t5 rows but is kept, with NULLs.
+        assert rows["Facebook"][1:] == [None, 500, None]
+
+    def test_division_is_real_not_integer(self):
+        # SUM of INTEGER columns must not integer-divide (9/1000 → 0).
+        r = client.post("/api/explore", json=_ratio_query())
+        ratio = {row[0]: row[3] for row in r.json()["rows"]}["YouTube"]
+        assert 0 < ratio < 1
+
+    def test_divide_by_zero_yields_null(self):
+        q = _ratio_query(derived=[{"alias": "r", "expr": "actions.a / (appeals.p - appeals.p)"}],
+                         sort=[])
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 200
+        assert all(row[3] is None for row in r.json()["rows"])
+
+    def test_having_filters_merged_rows(self):
+        q = _ratio_query(having={"and": [{"operation": "GT", "field_name": "p",
+                                          "field_values": [600]}]})
+        r = client.post("/api/explore", json=q)
+        assert [row[0] for row in r.json()["rows"]] == ["YouTube"]
+
+    def test_having_accepts_numeric_strings(self):
+        # The NL layer emits string values; numeric having columns coerce them.
+        q = _ratio_query(having={"and": [{"operation": "GT", "field_name": "ratio",
+                                          "field_values": ["0.001"]}]})
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 200
+        assert [row[0] for row in r.json()["rows"]] == ["YouTube"]
+
+    def test_leg_filters_apply_per_leg(self):
+        q = _ratio_query()
+        q["legs"]["appeals"]["query"] = {
+            "and": [{"operation": "EQ", "field_name": "service_name", "field_values": ["Facebook"]}]}
+        r = client.post("/api/explore", json=q)
+        rows = {row[0]: row for row in r.json()["rows"]}
+        assert rows["Facebook"][2] == 500
+        assert rows["YouTube"][2] is None  # filtered out of the appeals leg only
+
+    def test_multi_dim_join(self):
+        q = _ratio_query(join_on=["service_name", "platform"])
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 200
+        assert r.json()["columns"][:2] == ["service_name", "platform"]
+
+    def test_submitted_as_async_job(self):
+        job = _submit_and_wait(_ratio_query())
+        assert job["status"] == "done"
+        res = client.get(f"/api/jobs/{job['job_id']}/result?format=json", headers=ALICE)
+        assert res.status_code == 200
+        assert res.json()["columns"] == ["service_name", "a", "p", "ratio"]
+
+    # ── validation errors ──────────────────────────────────────────────────────
+
+    def test_join_dim_must_be_shared(self):
+        # category_code exists on t5 but not on t7 → 400 naming the shared dims.
+        r = client.post("/api/explore", json=_ratio_query(join_on=["category_code"]))
+        assert r.status_code == 400
+        assert "shared" in r.json()["detail"].lower()
+
+    def test_unknown_leg_table_rejected(self):
+        q = _ratio_query()
+        q["legs"]["actions"]["table"] = "nope"
+        assert client.post("/api/explore", json=q).status_code == 400
+
+    def test_duplicate_aggregate_alias_across_legs_rejected(self):
+        q = _ratio_query()
+        q["legs"]["appeals"]["aggregates"][0]["alias"] = "a"
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 400 and "unique" in r.json()["detail"].lower()
+
+    def test_unknown_expr_reference_rejected(self):
+        q = _ratio_query(derived=[{"alias": "r", "expr": "actions.a / nosuch.x"}])
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 400 and "nosuch.x" in r.json()["detail"]
+
+    def test_expr_tolerates_surrounding_whitespace(self):
+        q = _ratio_query(derived=[{"alias": "ratio", "expr": "  actions.a / appeals.p  "}])
+        assert client.post("/api/explore", json=q).status_code == 200
+
+    def test_malformed_exprs_rejected(self):
+        for expr in ["actions.a /", "(actions.a", "actions.a ; DROP TABLE x",
+                     "actions.a + 'x'", "actions"]:
+            q = _ratio_query(derived=[{"alias": "r", "expr": expr}], sort=[])
+            assert client.post("/api/explore", json=q).status_code == 400, expr
+
+    def test_having_on_unknown_column_rejected(self):
+        q = _ratio_query(having={"and": [{"operation": "GT", "field_name": "nope",
+                                          "field_values": [1]}]})
+        assert client.post("/api/explore", json=q).status_code == 400
+
+    def test_sort_on_unknown_column_rejected(self):
+        q = _ratio_query(sort=[{"field_name": "nope", "order": "desc"}])
+        assert client.post("/api/explore", json=q).status_code == 400
+
+    def test_legs_and_table_mutually_exclusive(self):
+        q = _ratio_query(table="t4_notices")
+        assert client.post("/api/explore", json=q).status_code == 400
+
+    def test_composite_fields_require_legs(self):
+        q = {"table": "t4_notices", "group_by": ["platform"],
+             "aggregates": [{"function": "SUM", "field_name": "notices", "alias": "n"}],
+             "derived": [{"alias": "r", "expr": "x.y"}]}
+        assert client.post("/api/explore", json=q).status_code == 400
+
+    def test_single_leg_rejected(self):
+        q = _ratio_query()
+        del q["legs"]["appeals"]
+        q["derived"] = []
+        q["sort"] = []
+        assert client.post("/api/explore", json=q).status_code == 422  # model bound
+
+    def test_explore_leg_cap(self):
+        q = _ratio_query()
+        for name in ("third", "fourth"):
+            q["legs"][name] = {"table": "t10_amar",
+                               "aggregates": [{"function": "SUM", "field_name": "value", "alias": f"v_{name}"}]}
+        r = client.post("/api/explore", json=q)
+        assert r.status_code == 400 and "legs" in r.json()["detail"]
+        # The keyed job API accepts the same 4-leg query.
+        assert client.post("/api/query", json=q, headers=ALICE).status_code == 202
+
+    def test_options_advertises_composite(self):
+        d = client.get("/api/explore/options").json()
+        assert d["composite"]["max_legs"] >= 2
+
+
 # ── Natural-language query (POST /api/ask) ───────────────────────────────────
 
 class TestAsk:
@@ -1157,6 +1312,29 @@ class TestAsk:
         assert d["columns"] == ["platform", "notices"]
         assert 0 < len(d["rows"]) <= 5
         assert [row[1] for row in d["rows"]] == sorted([row[1] for row in d["rows"]], reverse=True)
+
+    def test_ask_composite_generated_query_runs(self, monkeypatch):
+        # The NL layer can emit the composite shape: legs + join_on + derived.
+        import main
+        monkeypatch.setattr(main, "_translate_question", lambda q: {
+            "table": "t5_own_initiative_illegal", "filters": [], "group_by": [],
+            "aggregates": [], "max_count": 10,
+            "legs": [
+                {"name": "actions", "table": "t5_own_initiative_illegal", "filters": [],
+                 "aggregate": {"function": "SUM", "field": "measures", "alias": "a"}},
+                {"name": "appeals", "table": "t7_appeals_recidivism", "filters": [],
+                 "aggregate": {"function": "SUM", "field": "value", "alias": "p"}},
+            ],
+            "join_on": ["service_name"],
+            "derived": [{"alias": "ratio", "expr": "actions.a / appeals.p"}],
+            "sort": [{"field": "ratio", "order": "desc"}],
+        })
+        r = client.post("/api/ask", json={"question": "ratio of actions to appeals?"}, headers=ALICE)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["columns"] == ["service_name", "a", "p", "ratio"]
+        rows = {row[0]: row for row in d["rows"]}
+        assert rows["YouTube"][3] == 0.009
 
     def test_ask_caps_rows(self, monkeypatch):
         import main
